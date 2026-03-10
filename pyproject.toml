@@ -1,0 +1,138 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "media-archive-sync"
+version = "0.1.0"
+description = "Download and organize media from web archives"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "djdembeck"}
+]
+keywords = ["download", "archive", "media", "sync", "crawler"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: System :: Archiving",
+]
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.31",
+    "beautifulsoup4>=4.12",
+    "tqdm>=4.66",
+    "rich>=13.0.0",
+    "defusedxml>=0.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.0.0",
+    "pytest-xdist>=3.0.0",
+    "pytest-timeout>=2.0.0",
+    "ruff>=0.1.0",
+    "black>=24.0.0",
+    "mypy>=1.0.0",
+    "responses>=0.24",  # For mocking HTTP requests in tests
+    "httmock>=1.4",     # Alternative HTTP mocking
+]
+
+[project.scripts]
+media-archive-sync = "media_archive_sync.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/djdembeck/media-archive-sync"
+Documentation = "https://github.com/djdembeck/media-archive-sync#readme"
+Repository = "https://github.com/djdembeck/media-archive-sync.git"
+Issues = "https://github.com/djdembeck/media-archive-sync/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/media_archive_sync"]
+
+[tool.pytest.ini_options]
+# Test paths and patterns
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+# Default options
+defaults = [
+    "-ra",              # Show summary of all test outcomes
+    "-q",               # Quiet mode
+    "--strict-markers", # Fail on unknown markers
+    "--tb=short",       # Short traceback format
+    "--disable-warnings",  # Disable warnings
+]
+
+# Coverage reporting (for CI)
+coverage = [
+    "--cov=src/media_archive_sync",
+    "--cov-report=xml",
+    "--cov-report=term-missing",
+]
+
+# Combine defaults + coverage
+addopts = defaults + coverage
+
+# Timeout for tests (30 seconds default, can be overridden with --timeout)
+timeout = 30
+
+# Custom markers for categorizing tests
+markers = [
+    "slow: Marks tests as slow (deselect with '-m \"not slow\"')",
+    "subprocess: Marks tests that spawn subprocesses",
+    "integration: Marks integration tests",
+    "network: Marks tests that require network access",
+]
+
+# Filter warnings
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+
+[tool.black]
+line-length = 88
+target-version = ['py311']
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+extend-ignore = ["E203", "E501"]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # Pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "W",   # pycodestyle warnings
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = true
+disallow_untyped_decorators = false
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+show_error_codes = true

@@ -1,0 +1,43 @@
+# Python
+.cache
+*.pyc
+__pycache__/
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Testing
+htmlcov/
+.coverage
+.pytest_cache/
+.mypy_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+media/
+*.partial
+*.partial.*
+downloads/
+temp/
+
+# Logs
+*.log
+log.txt
+
+# Oh-My-OpenCode
+oh-my-opencode.json
+.sisyphus/

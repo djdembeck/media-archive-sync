@@ -1,0 +1,58 @@
+# CodeRabbit configuration for media-archive-sync
+# https://docs.coderabbit.ai/guides/configure-coderabbit
+
+language: en-US
+
+reviews:
+  # Review settings
+  profile: "chill"  # Options: "chill", "balanced", "assertive"
+
+  # Auto-review settings
+  auto_review:
+    enabled: true
+    auto_incremental_reviews: true
+    drafts: false
+
+    # Base branches to review
+    base_branches:
+      - "main"
+      - "dev"
+      - "release/*"
+
+  # Tools configuration
+  tools:
+    # Static analysis
+    ruff:
+      enabled: true
+
+    # Type checking
+    mypy:
+      enabled: true
+
+    # Security scanning
+    bandit:
+      enabled: true
+
+    # Spell checking
+    languagetool:
+      enabled: true
+      level: "default"
+
+  # Path filters (what to review)
+  path_filters:
+    - "!**/*.md"
+    - "!**/tests/**"
+    - "!examples/**"
+
+  # Comment settings
+  review_comment:
+    enabled: true
+    collapse_walkthrough: true
+
+# Chat settings
+chat:
+  auto_reply: true
+
+# Knowledge base (optional)
+knowledge_base:
+  opt_out: true
