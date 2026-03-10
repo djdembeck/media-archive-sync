@@ -20,6 +20,11 @@ from .downloader import (
     download_with_config,
     DownloadManager,
 )
+from .merge import (
+    merge_video_parts,
+    detect_video_parts,
+    get_video_duration,
+)
 
 __all__ = [
     "__version__",
@@ -41,4 +46,7 @@ __all__ = [
     "download_files",
     "download_with_config",
     "DownloadManager",
+    "merge_video_parts",
+    "detect_video_parts",
+    "get_video_duration",
 ]
