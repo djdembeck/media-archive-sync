@@ -168,6 +168,7 @@ def download_files(
     def worker(item: Tuple[str, Path]) -> Tuple[bool, bool]:
         """Download a single file. Returns (success, skipped)."""
         url, local_path = item
+        session = None
 
         if stop_event.is_set():
             return False, False
@@ -197,6 +198,7 @@ def download_files(
                 return False, False
 
             attempt += 1
+            session = None
 
             try:
                 session = requests.Session()
@@ -294,8 +296,8 @@ def download_files(
                 except Exception:
                     pass
 
-        time.sleep(0.5)
-        os._exit(1)
+        # Raise KeyboardInterrupt to allow proper cleanup
+        raise KeyboardInterrupt()
 
     signal.signal(signal.SIGINT, _sigint_handler)
 

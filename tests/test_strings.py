@@ -56,7 +56,7 @@ class TestSanitizeTitleForFilename:
     def test_basic_sanitization(self):
         """Test basic filename sanitization."""
         result = sanitize_title_for_filename("My Video Title")
-        assert "My Video Title" in result or "my video title" in result.lower()
+        assert result == "My.Video.Title"
 
     def test_custom_replacements(self):
         """Test custom replacement dictionary."""
@@ -66,7 +66,12 @@ class TestSanitizeTitleForFilename:
         assert "?" not in result
 
     def test_strip_tokens(self):
-        """Test token stripping."""
+        """Test token stripping - tokens must start with '!' to be stripped."""
+        # Tokens with '!' prefix should be stripped
+        result = sanitize_title_for_filename("Video !gg !tts", strip_tokens={"gg", "tts"})
+        assert "!gg" not in result
+        assert "!tts" not in result
+        # Tokens without '!' prefix should NOT be stripped
         result = sanitize_title_for_filename("Video gg tts", strip_tokens={"gg", "tts"})
-        assert "gg" not in result
-        assert "tts" not in result
+        assert "gg" in result
+        assert "tts" in result

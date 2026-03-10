@@ -134,6 +134,11 @@ def sanitize_title_for_filename(
     # Strip bang tokens using the provided token set
     s = _strip_bang_tokens(str(title), strip_tokens)
 
+    # Apply custom replacements if provided
+    if replacements:
+        for old, new in replacements.items():
+            s = s.replace(old, new)
+
     s = re.sub(r"[^\w\- ]+", "", s)
     s = re.sub(r"\s+", " ", s).strip()
     s = s.replace("-", ".")

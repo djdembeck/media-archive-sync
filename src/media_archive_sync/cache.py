@@ -120,16 +120,18 @@ class Cache:
                 conn.execute("PRAGMA journal_mode=WAL")
             except sqlite3.Error:
                 pass
-            cur = conn.cursor()
-            cur.execute("SELECT v FROM kv WHERE k=?", (key,))
-            row = cur.fetchone()
-            conn.close()
-            if not row:
-                return None
             try:
-                return json.loads(row[0])
-            except json.JSONDecodeError:
-                return None
+                cur = conn.cursor()
+                cur.execute("SELECT v FROM kv WHERE k=?", (key,))
+                row = cur.fetchone()
+                if not row:
+                    return None
+                try:
+                    return json.loads(row[0])
+                except json.JSONDecodeError:
+                    return None
+            finally:
+                conn.close()
         except sqlite3.Error as exc:
             logger.debug("SQLite get failed for key '%s': %s", key, exc)
             return None
@@ -178,14 +180,16 @@ class Cache:
                 conn.execute("PRAGMA journal_mode=WAL")
             except sqlite3.Error:
                 pass
-            cur = conn.cursor()
-            txt = json.dumps(value, ensure_ascii=False)
-            cur.execute(
-                "INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)",
-                (key, txt),
-            )
-            conn.commit()
-            conn.close()
+            try:
+                cur = conn.cursor()
+                txt = json.dumps(value, ensure_ascii=False)
+                cur.execute(
+                    "INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)",
+                    (key, txt),
+                )
+                conn.commit()
+            finally:
+                conn.close()
         except sqlite3.Error as exc:
             logger.warning("SQLite set failed for key '%s': %s", key, exc)
 
@@ -224,10 +228,12 @@ class Cache:
             if not self.db_path.is_file():
                 return
             conn = sqlite3.connect(str(self.db_path), timeout=30)
-            cur = conn.cursor()
-            cur.execute("DELETE FROM kv WHERE k=?", (key,))
-            conn.commit()
-            conn.close()
+            try:
+                cur = conn.cursor()
+                cur.execute("DELETE FROM kv WHERE k=?", (key,))
+                conn.commit()
+            finally:
+                conn.close()
         except sqlite3.Error as exc:
             logger.debug("SQLite delete failed for key '%s': %s", key, exc)
 
@@ -270,11 +276,13 @@ class Cache:
             if not self.db_path.is_file():
                 return False
             conn = sqlite3.connect(str(self.db_path), timeout=30)
-            cur = conn.cursor()
-            cur.execute("SELECT 1 FROM kv WHERE k=?", (key,))
-            row = cur.fetchone()
-            conn.close()
-            return row is not None
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT 1 FROM kv WHERE k=?", (key,))
+                row = cur.fetchone()
+                return row is not None
+            finally:
+                conn.close()
         except sqlite3.Error as exc:
             logger.debug("SQLite exists check failed for key '%s': %s", key, exc)
             return False
@@ -311,11 +319,13 @@ class Cache:
             if not self.db_path.is_file():
                 return []
             conn = sqlite3.connect(str(self.db_path), timeout=30)
-            cur = conn.cursor()
-            cur.execute("SELECT k FROM kv")
-            rows = cur.fetchall()
-            conn.close()
-            return [row[0] for row in rows]
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT k FROM kv")
+                rows = cur.fetchall()
+                return [row[0] for row in rows]
+            finally:
+                conn.close()
         except sqlite3.Error as exc:
             logger.debug("SQLite keys query failed: %s", exc)
             return []
@@ -348,10 +358,12 @@ class Cache:
             if not self.db_path.is_file():
                 return
             conn = sqlite3.connect(str(self.db_path), timeout=30)
-            cur = conn.cursor()
-            cur.execute("DELETE FROM kv")
-            conn.commit()
-            conn.close()
+            try:
+                cur = conn.cursor()
+                cur.execute("DELETE FROM kv")
+                conn.commit()
+            finally:
+                conn.close()
         except sqlite3.Error as exc:
             logger.warning("SQLite clear failed: %s", exc)
 
