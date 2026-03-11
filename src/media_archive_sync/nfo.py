@@ -171,12 +171,9 @@ def build_movie_nfo(
             if key in seen_actors:
                 continue
             seen_actors.add(key)
-            try:
-                actor_el = ET.SubElement(movie, "actor")
-                name_el = ET.SubElement(actor_el, "name")
-                name_el.text = name
-            except Exception:
-                pass
+            actor_el = ET.SubElement(movie, "actor")
+            name_el = ET.SubElement(actor_el, "name")
+            name_el.text = name
 
     if genres:
         seen_genres = set()
@@ -237,10 +234,9 @@ def write_nfo_for_path(video_path, nfo_data: str, overwrite: bool = False) -> bo
                 if existing == nfo_data:
                     logger.debug("NFO unchanged, skipping: %s", p)
                     return False
-            except OSError:
-                # If we can't read the existing file, skip to be safe
-                logger.debug("Cannot read existing NFO, skipping: %s", p)
-                return False
+            except (OSError, IOError) as e:
+                # Read failed, log and proceed to attempt write
+                logger.warning("Cannot read existing NFO %s: %s", p, e)
         else:
             logger.info("Overwriting existing NFO: %s", p)
 
