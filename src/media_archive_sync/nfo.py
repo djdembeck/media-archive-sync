@@ -8,6 +8,7 @@ import contextlib
 import html
 import os
 import re
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -146,22 +147,28 @@ def build_movie_nfo(
     _add_text("director", director)
 
     # Add collections/sets
+    # Normalize and filter entries first, sort sets for determinism
+    collection_entries: list[str] = []
     if collections:
-        c_el = ET.SubElement(movie, "collections")
         if isinstance(collections, (list, tuple, set)):
-            for s in collections:
-                if s is None:
-                    continue
-                ss = str(s).strip()
-                if not ss:
-                    continue
-                set_el = ET.SubElement(c_el, "set")
-                set_el.text = ss
+            items = collections
         else:
-            ss = str(collections).strip()
+            items = [collections]
+        for s in items:
+            if s is None:
+                continue
+            ss = str(s).strip()
             if ss:
-                set_el = ET.SubElement(c_el, "set")
-                set_el.text = ss
+                collection_entries.append(ss)
+        # Sort if original was a set to ensure deterministic order
+        if isinstance(collections, set):
+            collection_entries = sorted(collection_entries)
+    # Only create wrapper element if there are valid entries
+    if collection_entries:
+        c_el = ET.SubElement(movie, "collections")
+        for ss in collection_entries:
+            set_el = ET.SubElement(c_el, "set")
+            set_el.text = ss
 
     if actors:
         seen_actors = set()
@@ -250,8 +257,6 @@ def write_nfo_for_path(video_path, nfo_data: str, overwrite: bool = False) -> bo
         p.parent.mkdir(parents=True, exist_ok=True)
 
     # Write to temp file and atomically replace to avoid corruption on crash
-    import tempfile
-
     fd, temp_path = tempfile.mkstemp(dir=p.parent, suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:

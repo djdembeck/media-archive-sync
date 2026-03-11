@@ -80,9 +80,17 @@ FORCE_PROGRESS = False
 NO_COLOR = "NO_COLOR" in os.environ
 
 
-def _stderr_is_tty() -> bool:
-    """Check if stderr is attached to a TTY."""
-    return hasattr(sys.stderr, "isatty") and sys.stderr.isatty()
+def _stderr_is_tty(stream: TextIO | None = None) -> bool:
+    """Check if a stream is attached to a TTY.
+
+    Args:
+        stream: The stream to check. Defaults to sys.stderr if not provided.
+
+    Returns:
+        True if the stream is attached to a TTY, False otherwise.
+    """
+    s = stream if stream is not None else sys.stderr
+    return hasattr(s, "isatty") and s.isatty()
 
 
 def tqdm_or_stderr(
@@ -115,7 +123,7 @@ def tqdm_or_stderr(
     if file is None:
         file = sys.stderr
     if disable is None:
-        disable = not (FORCE_PROGRESS or _stderr_is_tty())
+        disable = not (FORCE_PROGRESS or _stderr_is_tty(file))
 
     return tqdm(
         iterable=iterable,
@@ -210,13 +218,15 @@ if RICH_AVAILABLE:
                     SpinnerColumn(),
                     TextColumn("{task.description}"),
                     BarColumn(),
-                    TextColumn("[{task.completed}/{task.total}]"),
+                    TextColumn("[{task.completed}/{task.total} {task.fields[unit]}]"),
                     TimeRemainingColumn(),
                     console=Console(stderr=True, no_color=NO_COLOR),
                     disable=self.disable,
                 )
                 self._progress.start()
-                self._task_id = self._progress.add_task(self.desc, total=self.total)
+                self._task_id = self._progress.add_task(
+                    self.desc, total=self.total, unit=self.unit
+                )
             return self
 
         def __exit__(self, *exc) -> bool:
@@ -318,20 +328,34 @@ def simple_progress(
         yield p
 
 
-def safe_print(message: str, *args) -> None:
+def safe_print(message: str, *args, console: Any | None = None) -> None:
     """Print a message safely without interfering with progress bars.
 
-    Uses stderr and handles the case where progress bars might be active.
+    Prefers tqdm.write or Rich Console to avoid interleaving with active
+    progress bars. Falls back to print() if neither is available.
 
     Args:
         message: The message format string.
         *args: Arguments to format into the message.
+        console: Optional Rich Console instance to use for output.
     """
     if args:
         try:
             message = message % args
         except (TypeError, ValueError):
             message = message + " " + " ".join(map(str, args))
+
+    # Prefer Rich Console if provided
+    if console is not None:
+        console.print(message)
+        return
+
+    # Prefer tqdm.write when tqdm is available (not the dummy)
+    if tqdm is not _DummyTqdm:
+        tqdm.write(message, file=sys.stderr)
+        return
+
+    # Fallback to regular print
     print(message, file=sys.stderr)
 
 

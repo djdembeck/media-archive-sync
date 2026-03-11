@@ -149,10 +149,13 @@ def crawl_archive(
             parsed_path = parsed_url.path
             if re.search(rf"\.({ext_pattern})$", parsed_path, re.I):
                 # Filter to only include URLs under the intended archive root
-                parsed_base = urllib.parse.urlparse(remote_base_normalized)
+                # Use prefix (which respects start_dir when provided) for path check
+                parsed_base = urllib.parse.urlparse(prefix)
                 if parsed_url.netloc != parsed_base.netloc:
                     continue
-                if not parsed_url.path.startswith(parsed_base.path):
+                # Normalize paths for comparison to handle leading/trailing slashes
+                effective_root = parsed_base.path.rstrip("/") + "/"
+                if not parsed_url.path.startswith(effective_root):
                     continue
                 decoded_name = urldecode(Path(parsed_path).name)
                 media_list.append((full_url, decoded_name))
@@ -183,23 +186,35 @@ def fetch_directory(
     extensions = allowed_extensions or {".mp4", ".mkv", ".avi", ".mov", ".webm"}
     ext_pattern = "|".join(re.escape(ext.lstrip(".")) for ext in extensions)
     try:
+        # Normalize dir_url to ensure it ends with a slash for safe urljoin
+        normalized_dir_url = dir_url.rstrip("/") + "/"
+        parsed_base = urllib.parse.urlparse(normalized_dir_url)
         html = fetch_html(dir_url)
         if not html:
             return out
         soup = BeautifulSoup(html, "html.parser")
         for a in soup.find_all("a", href=True):
             href = a["href"]
+            # Skip parent directory and self references
             if href in ("../", "./"):
                 continue
             if href.endswith("/"):
+                continue
+            # Resolve the href against the normalized base URL
+            full = urllib.parse.urljoin(normalized_dir_url, href)
+            parsed_full = urllib.parse.urlparse(full)
+            # Validate: must stay within the same host and base path
+            if parsed_full.netloc != parsed_base.netloc:
+                continue
+            base_path = parsed_base.path.rstrip("/") + "/"
+            if not parsed_full.path.startswith(base_path):
                 continue
             # Filter to only include media files with allowed extensions
             # Parse the path to ignore query strings when checking extensions
             href_path = urllib.parse.urlparse(href).path
             if not re.search(rf"\.({ext_pattern})$", href_path, re.I):
                 continue
-            full = urllib.parse.urljoin(dir_url, href)
-            dec = urldecode(Path(urllib.parse.urlparse(full).path).name)
+            dec = urldecode(Path(parsed_full.path).name)
             out.append((full, dec))
     except (requests.RequestException, Exception) as e:
         logger.debug("Failed to fetch directory listing %s: %s", dir_url, e)
