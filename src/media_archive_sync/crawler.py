@@ -142,6 +142,13 @@ def crawl_archive(
             href = a["href"]
             if re.search(rf"\.({ext_pattern})$", href, re.I):
                 full_url = urllib.parse.urljoin(dir_url, href)
+                # Filter to only include URLs under the intended archive root
+                parsed_url = urllib.parse.urlparse(full_url)
+                parsed_base = urllib.parse.urlparse(remote_base_normalized)
+                if parsed_url.netloc != parsed_base.netloc:
+                    continue
+                if not parsed_url.path.startswith(parsed_base.path):
+                    continue
                 decoded_name = urldecode(Path(href).name)
                 media_list.append((full_url, decoded_name))
                 dir_counts[dir_url] += 1
@@ -284,7 +291,9 @@ def filter_cached_index_for_period(
     media_list = media_list or []
     dir_counts = dict(dir_counts or {})
     normalized_periodic = periodic_dir.rstrip("/") + "/"
-    if normalized_periodic in dir_counts:
+    # Normalize dir_counts keys for consistent lookup
+    normalized_dir_counts = {k.rstrip("/") + "/": v for k, v in dir_counts.items()}
+    if normalized_periodic in normalized_dir_counts:
         filtered = [it for it in media_list if it[0].startswith(normalized_periodic)]
         return filtered, {normalized_periodic: len(filtered)}, True
     return media_list, dir_counts, False

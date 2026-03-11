@@ -42,6 +42,7 @@ def download_file(
     progress_callback: Callable[[int, int], None] | None = None,
     stop_event: threading.Event | None = None,
     session: requests.Session | None = None,
+    partial_ext: str = ".partial",
 ) -> tuple[bool, int]:
     """Download a single file from URL to local path.
 
@@ -57,11 +58,12 @@ def download_file(
         progress_callback: Optional callback(bytes_downloaded, total_bytes).
         stop_event: Optional threading.Event to check for cancellation.
         session: Optional requests.Session to use (creates new one if None).
+        partial_ext: Extension for partial download files.
 
     Returns:
         Tuple of (success: bool, bytes_downloaded: int).
     """
-    temp_path = local_path.with_suffix(local_path.suffix + ".partial")
+    temp_path = local_path.with_suffix(local_path.suffix + partial_ext)
     temp_path.parent.mkdir(parents=True, exist_ok=True)
 
     headers: dict[str, str] = {}
@@ -82,13 +84,13 @@ def download_file(
             session = requests.Session()
             session.mount("https://", HTTPAdapter(max_retries=1))
 
-        with session:  # Context manager ensures session.close() on exit
-            with session.get(
+        def _do_download(_session: requests.Session) -> tuple[bool, int]:
+            with _session.get(
                 url, stream=True, timeout=timeout, headers=headers
             ) as response:
                 if response.status_code == 416:
                     try:
-                        head = session.head(url, timeout=timeout, allow_redirects=True)
+                        head = _session.head(url, timeout=timeout, allow_redirects=True)
                         expected_size = int(head.headers.get("Content-Length", "-1"))
                         actual_size = temp_path.stat().st_size
                         if expected_size > 0 and actual_size >= expected_size:
@@ -105,7 +107,7 @@ def download_file(
                         chunk_size,
                         progress_callback,
                         _stop_event,
-                        session,
+                        _session,
                     )
 
                 response.raise_for_status()
@@ -136,6 +138,14 @@ def download_file(
             temp_path.replace(local_path)
             logger.debug("Successfully downloaded %s -> %s", url, local_path)
             return True, downloaded
+
+        if own_session:
+            with session:
+                result = _do_download(session)
+                return result
+        else:
+            result = _do_download(session)
+            return result
 
     except requests.exceptions.RequestException as exc:
         logger.warning("Download failed for %s: %s", url, exc)
@@ -458,6 +468,7 @@ class DownloadManager:
                 progress_callback=wrapped_callback,
                 stop_event=self._stop_event,
                 session=session,
+                partial_ext=self.config.partial_extension,
             )
         finally:
             if session is not None:
