@@ -289,7 +289,7 @@ def rich_progress_or_stderr(
 def simple_progress(
     desc: str = "Processing",
     total: Optional[int] = None,
-    disable: bool = False,
+    disable: Optional[bool] = None,
 ):
     """Simple context manager for progress tracking.
 
@@ -299,7 +299,7 @@ def simple_progress(
     Args:
         desc: Description of the operation being tracked.
         total: Total number of items to process (None for unknown).
-        disable: Whether to disable the progress display.
+        disable: Whether to disable the progress display (None for autodetect).
 
     Yields:
         A progress object with update() and write() methods.

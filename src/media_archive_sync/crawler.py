@@ -224,6 +224,7 @@ def save_metadata(dir_url: str, media_meta_file: Path) -> None:
     }
 
     try:
+        media_meta_file.parent.mkdir(parents=True, exist_ok=True)
         with media_meta_file.open("w", encoding="utf-8") as mf:
             json.dump(meta, mf, indent=2, ensure_ascii=False)
         logger.debug("Saved media meta for %s", dir_url)

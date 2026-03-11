@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -76,24 +77,18 @@ class Cache:
         safe_prefix = "".join(c for c in key[:32] if c.isalnum() or c in "_-").rstrip()
         if not safe_prefix:
             safe_prefix = "_"
-        return self.cache_dir / f"{safe_prefix}_{key_hash}.json"
+        return self.cache_dir / f"{safe_prefix}_{key_hash}.cache.json"
 
     def _get_key_from_json(self, path: Path) -> str | None:
-        """Extract the original key from a JSON cache file.
-
-        Args:
-            path: Path to the JSON cache file.
-
-        Returns:
-            The original cache key, or None if not found.
-        """
+        """Extract the original key from a JSON cache file."""
         try:
             with path.open("r", encoding="utf-8") as f:
                 data = json.load(f)
-            # Check if this is the new format with metadata
+            if isinstance(data, dict) and "_cache_envelope" in data:
+                envelope = data["_cache_envelope"]
+                return envelope.get("key") if isinstance(envelope, dict) else None
             if isinstance(data, dict) and "_cache_key" in data:
                 return data["_cache_key"]
-            # Legacy format: return stem as key (may be truncated)
             return path.stem
         except (OSError, json.JSONDecodeError):
             return None
@@ -163,14 +158,7 @@ class Cache:
             return None
 
     def _get_json(self, key: str) -> Any | None:
-        """Retrieve a value from a JSON file.
-
-        Args:
-            key: The cache key.
-
-        Returns:
-            The cached value, or None if not found or on error.
-        """
+        """Retrieve a value from a JSON file."""
         try:
             path = self._get_json_path(key)
             if not path.is_file():
@@ -178,6 +166,11 @@ class Cache:
             with path.open("r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict):
+                if "_cache_envelope" in data:
+                    envelope = data["_cache_envelope"]
+                    if isinstance(envelope, dict) and "value" in envelope:
+                        return envelope["value"]
+                    return None
                 if "_cache_value" in data:
                     return data["_cache_value"]
                 return {k: v for k, v in data.items() if k != "_cache_key"}
@@ -225,20 +218,16 @@ class Cache:
             logger.warning("SQLite set failed for key '%s': %s", key, exc)
 
     def _set_json(self, key: str, value: Any) -> None:
-        """Store a value in a JSON file.
-
-        Args:
-            key: The cache key.
-            value: The value to cache.
-        """
+        """Store a value in a JSON file."""
         try:
             path = self._get_json_path(key)
-            if isinstance(value, dict):
-                wrapped = {**value, "_cache_key": key}
-            else:
-                wrapped = {"_cache_value": value, "_cache_key": key}
-            with path.open("w", encoding="utf-8") as f:
+            wrapped = {"_cache_envelope": {"key": key, "value": value}}
+            temp_path = path.with_suffix(path.suffix + ".tmp")
+            with temp_path.open("w", encoding="utf-8") as f:
                 json.dump(wrapped, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            temp_path.replace(path)
         except (OSError, TypeError, ValueError) as exc:
             logger.warning("JSON set failed for key '%s': %s", key, exc)
 
@@ -366,14 +355,10 @@ class Cache:
             return []
 
     def _keys_json(self) -> list[str]:
-        """Get all keys from JSON files.
-
-        Returns:
-            List of all cache keys.
-        """
+        """Get all keys from JSON cache files."""
         try:
             keys = []
-            for path in self.cache_dir.glob("*.json"):
+            for path in self.cache_dir.glob("*.cache.json"):
                 key = self._get_key_from_json(path)
                 if key:
                     keys.append(key)
@@ -405,9 +390,9 @@ class Cache:
             logger.warning("SQLite clear failed: %s", exc)
 
     def _clear_json(self) -> None:
-        """Clear all values from JSON files."""
+        """Clear all values from JSON cache files."""
         try:
-            for path in self.cache_dir.glob("*.json"):
+            for path in self.cache_dir.glob("*.cache.json"):
                 path.unlink()
         except OSError as exc:
             logger.warning("JSON clear failed: %s", exc)

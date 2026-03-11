@@ -63,9 +63,14 @@ def main():
 
     def _compute_target_path(url: str, local_root: Path) -> Path:
         parsed = urllib.parse.urlparse(url)
-        path = parsed.path if parsed.path.startswith("/") else "/" + parsed.path
+        decoded_path = urllib.parse.unquote(parsed.path)
+        path = decoded_path if decoded_path.startswith("/") else "/" + decoded_path
         rel_path = Path(path).relative_to("/")
-        return local_root / rel_path
+        target = (local_root / rel_path).resolve()
+        local_root_resolved = local_root.resolve()
+        if not target.is_relative_to(local_root_resolved):
+            raise ValueError(f"Path traversal detected: {rel_path}")
+        return target
 
     if not args.dry_run:
         download_with_config(

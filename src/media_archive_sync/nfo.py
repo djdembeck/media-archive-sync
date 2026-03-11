@@ -35,13 +35,15 @@ def parse_release_date(candidate) -> Optional[str]:
     if candidate is None:
         return None
 
-    # Try timestamp parsing
+    # Try timestamp parsing (validate realistic epoch range)
     try:
         val = float(candidate)
-        if val > 1e11:
-            val = val / 1000.0
-        dt = datetime.fromtimestamp(val, tz=timezone.utc)
-        return dt.date().isoformat()
+        # Only treat as timestamp if in realistic epoch range (>1e9, <1e12)
+        if 1e9 < val < 1e12:
+            if val > 1e11:
+                val = val / 1000.0
+            dt = datetime.fromtimestamp(val, tz=timezone.utc)
+            return dt.date().isoformat()
     except (ValueError, TypeError, OverflowError):
         pass
 
@@ -55,11 +57,14 @@ def parse_release_date(candidate) -> Optional[str]:
     except (ValueError, TypeError):
         pass
 
-    # Fallback to first 10 characters
+    # Fallback to first 10 characters with YYYY-MM-DD validation
     try:
         s2 = str(candidate).strip()
         if len(s2) >= 10:
-            return s2[:10]
+            candidate_date = s2[:10]
+            # Validate YYYY-MM-DD format
+            if re.match(r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$", candidate_date):
+                return candidate_date
     except (ValueError, TypeError):
         pass
 
@@ -227,18 +232,18 @@ def write_nfo_for_path(video_path, nfo_data: str, overwrite: bool = False) -> bo
     p = ppath.with_suffix(".nfo")
 
     if p.is_file():
-        try:
-            existing = p.read_text(encoding="utf-8")
-            if existing == nfo_data and not overwrite:
-                return False
-        except (OSError, IOError):
-            pass
-
         if not overwrite:
-            logger.info("NFO exists and overwrite is False, skipping: %s", p)
-            return False
-
-        logger.info("Overwriting existing NFO: %s", p)
+            try:
+                existing = p.read_text(encoding="utf-8")
+                if existing == nfo_data:
+                    logger.debug("NFO unchanged, skipping: %s", p)
+                    return False
+            except (OSError, IOError):
+                # If we can't read the existing file, skip to be safe
+                logger.debug("Cannot read existing NFO, skipping: %s", p)
+                return False
+        else:
+            logger.info("Overwriting existing NFO: %s", p)
 
     try:
         p.parent.mkdir(parents=True, exist_ok=True)

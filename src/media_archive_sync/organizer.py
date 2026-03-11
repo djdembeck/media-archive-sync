@@ -93,23 +93,24 @@ def load_local_files(
     local_root: Path,
     video_extensions: Optional[Set[str]] = None,
     use_mtime: bool = True,
-) -> Dict[str, Path]:
-    """Scan local directories and build a filename-to-path mapping.
+) -> Dict[str, List[Path]]:
+    """Scan local directories and build a filename-to-paths mapping.
 
     Walks the directory tree starting from local_root, indexing all
-    files. Optionally filters by video extensions.
+    files. Optionally filters by video extensions. Duplicate filenames
+    from different directories are preserved.
 
     Args:
         local_root: Base local directory to scan.
         video_extensions: Optional set of extensions to filter by
             (e.g., {'.mp4', '.mkv'}). If None, all files are indexed.
-        use_mtime: If True, when duplicate filenames exist, keep the
-            one with the most recent modification time.
+        use_mtime: If True, when duplicate filenames exist, keep only
+            the one with the most recent modification time per basename.
 
     Returns:
-        Dictionary mapping filenames to their Path objects.
+        Dictionary mapping filenames to lists of Path objects.
     """
-    mapping: Dict[str, Path] = {}
+    mapping: Dict[str, List[Path]] = {}
 
     if not local_root.exists():
         logger.warning("Local root does not exist: %s", local_root)
@@ -134,13 +135,16 @@ def load_local_files(
                     if p.name in mapping:
                         if use_mtime:
                             try:
-                                prev = mapping[p.name]
-                                if p.stat().st_mtime > prev.stat().st_mtime:
-                                    mapping[p.name] = p
+                                existing_list = mapping[p.name]
+                                # Keep only the most recent file per basename
+                                if p.stat().st_mtime > existing_list[0].stat().st_mtime:
+                                    mapping[p.name] = [p]
                             except (OSError, PermissionError):
-                                mapping[p.name] = p
+                                mapping[p.name].append(p)
+                        else:
+                            mapping[p.name].append(p)
                     else:
-                        mapping[p.name] = p
+                        mapping[p.name] = [p]
 
                     file_count += 1
                     if file_count % 1000 == 0:
@@ -159,7 +163,7 @@ def load_local_files(
     except (OSError, PermissionError) as e:
         logger.warning("Error scanning local files: %s", e)
 
-    logger.info("Found %d existing local files in %s", len(mapping), local_root)
+    logger.info("Found %d existing local file entries in %s", len(mapping), local_root)
     return mapping
 
 
@@ -169,7 +173,7 @@ def load_local_index(
     video_extensions: Optional[Set[str]] = None,
     use_cache: bool = True,
     max_cache_age: Optional[int] = 3600,
-) -> Dict[str, Path]:
+) -> Dict[str, List[Path]]:
     """Load or build a cached index of local files.
 
     Attempts to load from JSON cache first; if unavailable or stale,
@@ -183,7 +187,7 @@ def load_local_index(
         max_cache_age: Maximum cache age in seconds (default: 1 hour).
 
     Returns:
-        Dictionary mapping filenames to their Path objects.
+        Dictionary mapping filenames to lists of Path objects.
     """
     if use_cache and cache_file.exists():
         try:
@@ -194,7 +198,13 @@ def load_local_index(
             else:
                 with cache_file.open("r", encoding="utf-8") as f:
                     data = json.load(f)
-                mapping = {k: Path(v) for k, v in data.items()}
+                mapping: Dict[str, List[Path]] = {}
+                for k, v in data.items():
+                    if isinstance(v, list):
+                        mapping[k] = [Path(p) for p in v]
+                    else:
+                        # Legacy format: single path
+                        mapping[k] = [Path(v)]
                 logger.debug("Loaded local file index: %d entries", len(mapping))
                 return mapping
         except (OSError, PermissionError, json.JSONDecodeError) as e:
@@ -206,7 +216,7 @@ def load_local_index(
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         with cache_file.open("w", encoding="utf-8") as f:
             json.dump(
-                {k: str(v) for k, v in mapping.items()},
+                {k: [str(p) for p in v] for k, v in mapping.items()},
                 f,
                 indent=2,
                 ensure_ascii=False,
@@ -220,7 +230,7 @@ def load_local_index(
 
 def organize_files_by_month(
     local_root: Path,
-    files: Optional[Dict[str, Path]] = None,
+    files: Optional[Dict[str, List[Path]]] = None,
     month_format: str = "%b_%Y",
     video_extensions: Optional[Set[str]] = None,
     dry_run: bool = False,
@@ -246,26 +256,27 @@ def organize_files_by_month(
 
     organized: Dict[str, List[Path]] = {}
 
-    for filename, filepath in files.items():
-        # Extract epoch from filename
-        epoch = extract_epoch_from_name(filename)
-        if not epoch:
-            logger.debug("No epoch found in filename: %s", filename)
-            continue
+    for filename, filepath_list in files.items():
+        for filepath in filepath_list:
+            # Extract epoch from filename
+            epoch = extract_epoch_from_name(filename)
+            if not epoch:
+                logger.debug("No epoch found in filename: %s", filename)
+                continue
 
-        # Convert to datetime
-        dt = extract_date_from_epoch(epoch)
-        if not dt:
-            logger.debug("Could not extract date from epoch %d: %s", epoch, filename)
-            continue
+            # Convert to datetime
+            dt = extract_date_from_epoch(epoch)
+            if not dt:
+                logger.debug("Could not extract date from epoch %d: %s", epoch, filename)
+                continue
 
-        # Format month folder name
-        month_folder = dt.strftime(month_format)
+            # Format month folder name
+            month_folder = dt.strftime(month_format)
 
-        if month_folder not in organized:
-            organized[month_folder] = []
+            if month_folder not in organized:
+                organized[month_folder] = []
 
-        organized[month_folder].append(filepath)
+            organized[month_folder].append(filepath)
 
     if dry_run:
         logger.info("[DRY-RUN] Would organize %d files into %d month folders:",

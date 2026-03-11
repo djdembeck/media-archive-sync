@@ -40,6 +40,8 @@ def download_file(
     resume: bool = True,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     progress_callback: Optional[Callable[[int, int], None]] = None,
+    stop_event: Optional[threading.Event] = None,
+    session: Optional[requests.Session] = None,
 ) -> Tuple[bool, int]:
     """Download a single file from URL to local path.
 
@@ -53,6 +55,8 @@ def download_file(
         resume: If True, attempt to resume partial downloads.
         chunk_size: Size of download chunks in bytes.
         progress_callback: Optional callback(bytes_downloaded, total_bytes).
+        stop_event: Optional threading.Event to check for cancellation.
+        session: Optional requests.Session to use (creates new one if None).
 
     Returns:
         Tuple of (success: bool, bytes_downloaded: int).
@@ -70,50 +74,57 @@ def download_file(
             headers["Range"] = f"bytes={start_byte}-"
             logger.debug("Resuming download from byte %d for %s", start_byte, url)
 
+    _stop_event = stop_event or threading.Event()
+    own_session = session is None
+
     try:
-        session = requests.Session()
-        session.mount("https://", HTTPAdapter(max_retries=1))
+        if own_session:
+            session = requests.Session()
+            session.mount("https://", HTTPAdapter(max_retries=1))
 
-        with session.get(url, stream=True, timeout=timeout, headers=headers) as response:
-            if response.status_code == 416:
-                try:
-                    head = session.head(url, timeout=timeout, allow_redirects=True)
-                    expected_size = int(head.headers.get("Content-Length", "-1"))
-                    actual_size = temp_path.stat().st_size
-                    if expected_size > 0 and actual_size >= expected_size:
-                        temp_path.replace(local_path)
-                        return True, actual_size
-                except Exception:
-                    pass
-                temp_path.unlink(missing_ok=True)
-                return download_file(url, local_path, timeout, False, chunk_size, progress_callback)
+        with session:  # Context manager ensures session.close() on exit
+            with session.get(url, stream=True, timeout=timeout, headers=headers) as response:
+                if response.status_code == 416:
+                    try:
+                        head = session.head(url, timeout=timeout, allow_redirects=True)
+                        expected_size = int(head.headers.get("Content-Length", "-1"))
+                        actual_size = temp_path.stat().st_size
+                        if expected_size > 0 and actual_size >= expected_size:
+                            temp_path.replace(local_path)
+                            return True, actual_size
+                    except Exception:
+                        pass
+                    temp_path.unlink(missing_ok=True)
+                    return download_file(url, local_path, timeout, False, chunk_size, progress_callback, _stop_event, session)
 
-            response.raise_for_status()
+                response.raise_for_status()
 
-            mode = "ab" if response.status_code == 206 else "wb"
-            total_size = -1
-            try:
-                total_size = int(response.headers.get("Content-Length", "-1"))
-                if total_size >= 0 and start_byte > 0:
-                    total_size += start_byte
-            except (ValueError, TypeError):
+                mode = "ab" if response.status_code == 206 else "wb"
                 total_size = -1
+                try:
+                    total_size = int(response.headers.get("Content-Length", "-1"))
+                    if total_size >= 0 and start_byte > 0:
+                        total_size += start_byte
+                except (ValueError, TypeError):
+                    total_size = -1
 
-            downloaded = start_byte
+                downloaded = start_byte
 
-            with open(temp_path, mode) as f:
-                for chunk in response.iter_content(chunk_size=chunk_size):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if progress_callback:
-                            progress_callback(downloaded, total_size)
+                with open(temp_path, mode) as f:
+                    for chunk in response.iter_content(chunk_size=chunk_size):
+                        if _stop_event.is_set():
+                            raise KeyboardInterrupt()
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if progress_callback:
+                                progress_callback(downloaded, total_size)
 
-        # Move temp file to final location
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path.replace(local_path)
-        logger.debug("Successfully downloaded %s -> %s", url, local_path)
-        return True, downloaded
+            # Move temp file to final location
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path.replace(local_path)
+            logger.debug("Successfully downloaded %s -> %s", url, local_path)
+            return True, downloaded
 
     except requests.exceptions.RequestException as exc:
         logger.warning("Download failed for %s: %s", url, exc)
@@ -229,6 +240,9 @@ def download_files(
                     if start_byte > 0:
                         headers["Range"] = f"bytes={start_byte}-"
 
+                # Ensure parent directory exists before download
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+
                 with session.get(
                     url, stream=True, timeout=timeout, headers=headers
                 ) as response:
@@ -239,7 +253,8 @@ def download_files(
 
                     response.raise_for_status()
 
-                    mode = "ab" if headers.get("Range") else "wb"
+                    # Use status_code to determine mode (206 = partial content)
+                    mode = "ab" if response.status_code == 206 else "wb"
 
                     with _partials_lock:
                         _partials.add(temp_path)
@@ -251,7 +266,6 @@ def download_files(
                             if chunk:
                                 f.write(chunk)
 
-                local_path.parent.mkdir(parents=True, exist_ok=True)
                 temp_path.replace(local_path)
 
                 with _partials_lock:
@@ -395,22 +409,43 @@ class DownloadManager:
         if self._stop_event.is_set():
             return False, 0
 
-        # Wrap progress callback to include filename
-        wrapped_callback: Optional[Callable[[int, int], None]] = None
-        if self.progress_callback:
+        session: Optional[requests.Session] = None
+        temp_path = local_path.with_suffix(local_path.suffix + self.config.partial_extension)
 
-            def wrapped(bytes_done: int, total: int) -> None:
-                self.progress_callback(local_path.name, bytes_done, total)
+        try:
+            with self._sessions_lock:
+                session = requests.Session()
+                session.mount("https://", HTTPAdapter(max_retries=1))
+                self._active_sessions.add(session)
 
-            wrapped_callback = wrapped
+            with self._partials_lock:
+                self._partials.add(temp_path)
 
-        return download_file(
-            url=url,
-            local_path=local_path,
-            timeout=self.config.request_timeout,
-            resume=resume,
-            progress_callback=wrapped_callback,
-        )
+            # Wrap progress callback to include filename
+            wrapped_callback: Optional[Callable[[int, int], None]] = None
+            if self.progress_callback:
+
+                def wrapped(bytes_done: int, total: int) -> None:
+                    self.progress_callback(local_path.name, bytes_done, total)
+
+                wrapped_callback = wrapped
+
+            return download_file(
+                url=url,
+                local_path=local_path,
+                timeout=self.config.request_timeout,
+                resume=resume,
+                progress_callback=wrapped_callback,
+                stop_event=self._stop_event,
+                session=session,
+            )
+        finally:
+            if session is not None:
+                with self._sessions_lock:
+                    self._active_sessions.discard(session)
+                session.close()
+            with self._partials_lock:
+                self._partials.discard(temp_path)
 
     def download_batch(
         self,
