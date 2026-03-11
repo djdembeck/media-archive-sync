@@ -1,7 +1,10 @@
 """Tests for string utilities."""
 
-import pytest
-from media_archive_sync.strings import urldecode, normalise_string, sanitize_title_for_filename
+from media_archive_sync.strings import (
+    normalise_string,
+    sanitize_title_for_filename,
+    urldecode,
+)
 
 
 class TestUrldecode:
@@ -61,14 +64,18 @@ class TestSanitizeTitleForFilename:
     def test_custom_replacements(self):
         """Test custom replacement dictionary."""
         replacements = {"&": "and", "?": ""}
-        result = sanitize_title_for_filename("Foo & Bar? Baz", replacements=replacements)
+        result = sanitize_title_for_filename(
+            "Foo & Bar? Baz", replacements=replacements
+        )
         assert "and" in result
         assert "?" not in result
 
     def test_strip_tokens(self):
         """Test token stripping - tokens must start with '!' to be stripped."""
         # Tokens with '!' prefix should be stripped
-        result = sanitize_title_for_filename("Video !gg !tts", strip_tokens={"gg", "tts"})
+        result = sanitize_title_for_filename(
+            "Video !gg !tts", strip_tokens={"gg", "tts"}
+        )
         assert "!gg" not in result
         assert "!tts" not in result
         # Tokens without '!' prefix should NOT be stripped

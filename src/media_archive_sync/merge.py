@@ -9,7 +9,6 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import List, Optional, Tuple
 
 from .logging import get_logger
 
@@ -19,7 +18,7 @@ logger = get_logger(__name__)
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".mpg", ".mpeg"}
 
 
-def get_video_duration(video_path: Path, ffprobe_path: str = "ffprobe") -> Optional[float]:
+def get_video_duration(video_path: Path, ffprobe_path: str = "ffprobe") -> float | None:
     """Get video file duration using ffprobe.
 
     Args:
@@ -47,12 +46,17 @@ def get_video_duration(video_path: Path, ffprobe_path: str = "ffprobe") -> Optio
         )
         out = result.stdout.strip()
         return float(out) if out else None
-    except (subprocess.CalledProcessError, ValueError, FileNotFoundError, OSError) as exc:
+    except (
+        subprocess.CalledProcessError,
+        ValueError,
+        FileNotFoundError,
+        OSError,
+    ) as exc:
         logger.debug("Failed to get duration for %s: %s", video_path, exc)
         return None
 
 
-def detect_video_parts(directory: Path, base_name: str) -> List[Path]:
+def detect_video_parts(directory: Path, base_name: str) -> list[Path]:
     """Find multipart video files in a directory.
 
     Scans the directory for files matching the pattern {base_name}_part{N}.{ext}
@@ -65,7 +69,7 @@ def detect_video_parts(directory: Path, base_name: str) -> List[Path]:
     Returns:
         List of Paths to part files, sorted by part index.
     """
-    parts: List[Tuple[int, Path]] = []
+    parts: list[tuple[int, Path]] = []
 
     if not directory.exists() or not directory.is_dir():
         logger.debug("Directory does not exist or is not a directory: %s", directory)
@@ -78,7 +82,9 @@ def detect_video_parts(directory: Path, base_name: str) -> List[Path]:
             continue
 
         # Match pattern: base_name_partN.ext
-        pattern = re.escape(base_name) + r"_part(\d+)" + re.escape(file_path.suffix) + r"$"
+        pattern = (
+            re.escape(base_name) + r"_part(\d+)" + re.escape(file_path.suffix) + r"$"
+        )
         match = re.match(pattern, file_path.name, re.IGNORECASE)
         if match:
             part_index = int(match.group(1))
@@ -90,10 +96,10 @@ def detect_video_parts(directory: Path, base_name: str) -> List[Path]:
 
 
 def merge_video_parts(
-    part_paths: List[Path],
+    part_paths: list[Path],
     output_path: Path,
     ffmpeg_path: str = "ffmpeg",
-    ffprobe_path: Optional[str] = None,
+    ffprobe_path: str | None = None,
 ) -> bool:
     """Merge multiple video files using ffmpeg concat.
 
@@ -210,7 +216,7 @@ def _resolve_ffprobe_path(ffmpeg_cmd: str = "ffmpeg") -> str:
     return ffmpeg_cmd.replace("ffmpeg", "ffprobe")
 
 
-def _create_concat_list(part_paths: List[Path]) -> Optional[Path]:
+def _create_concat_list(part_paths: list[Path]) -> Path | None:
     """Create ffmpeg concat demuxer list file.
 
     Args:
@@ -220,9 +226,7 @@ def _create_concat_list(part_paths: List[Path]) -> Optional[Path]:
         Path to the created list file, or None if creation failed.
     """
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w", delete=False, suffix=".txt"
-        ) as f:
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".txt") as f:
             for part_path in part_paths:
                 # Use absolute path and escape single quotes
                 abs_path = str(part_path.resolve())
@@ -235,7 +239,7 @@ def _create_concat_list(part_paths: List[Path]) -> Optional[Path]:
         return None
 
 
-def should_merge_parts(parts: List[Path], base_file: Path) -> bool:
+def should_merge_parts(parts: list[Path], base_file: Path) -> bool:
     """Determine if a multipart group should be merged.
 
     A group should be merged when:
@@ -275,7 +279,7 @@ def extract_epoch_from_filename(name: str) -> int:
     return 0
 
 
-def order_parts_by_epoch(parts: List[Path]) -> List[Path]:
+def order_parts_by_epoch(parts: list[Path]) -> list[Path]:
     """Order part files by embedded epoch timestamp.
 
     Extracts epoch timestamps from filenames and sorts parts chronologically.
@@ -288,8 +292,8 @@ def order_parts_by_epoch(parts: List[Path]) -> List[Path]:
     Returns:
         List of part paths sorted by epoch (oldest first).
     """
-    with_epoch: List[Tuple[int, int, Path]] = []
-    without_epoch: List[Tuple[int, Path]] = []
+    with_epoch: list[tuple[int, int, Path]] = []
+    without_epoch: list[tuple[int, Path]] = []
 
     for idx, part in enumerate(parts):
         epoch = extract_epoch_from_filename(part.name)

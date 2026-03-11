@@ -9,15 +9,14 @@ import json
 import re
 import urllib.parse
 from collections import deque
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 import requests
 from bs4 import BeautifulSoup
 
-from .strings import urldecode
 from .logging import get_logger
+from .strings import urldecode
 
 logger = get_logger(__name__)
 
@@ -44,12 +43,12 @@ def fetch_html(url: str) -> str:
 
 
 def crawl_archive(
-    start_dir: Optional[str] = None,
-    remote_base: Optional[str] = None,
+    start_dir: str | None = None,
+    remote_base: str | None = None,
     max_depth: int = 10,
-    video_extensions: Optional[set] = None,
-    progress_callback: Optional[callable] = None,
-) -> Tuple[List[Tuple[str, str]], Dict[str, int]]:
+    video_extensions: set | None = None,
+    progress_callback: callable | None = None,
+) -> tuple[list[tuple[str, str]], dict[str, int]]:
     """Walk the remote Apache index and collect media entries.
 
     If `start_dir` is provided the crawl will be seeded from that
@@ -92,8 +91,8 @@ def crawl_archive(
     extensions = video_extensions or {".mp4", ".mkv", ".avi", ".mov", ".webm"}
     ext_pattern = "|".join(re.escape(ext.lstrip(".")) for ext in extensions)
 
-    media_list: List[Tuple[str, str]] = []
-    dir_counts: Dict[str, int] = {}
+    media_list: list[tuple[str, str]] = []
+    dir_counts: dict[str, int] = {}
 
     queue: deque[str] = deque([base_url])
     visited: set[str] = {base_url}
@@ -130,7 +129,10 @@ def crawl_archive(
             if href.endswith("/"):
                 sub_url = urllib.parse.urljoin(dir_url, href)
                 normalized_url = sub_url.rstrip("/") + "/"
-                if normalized_url.startswith(remote_base_normalized) and normalized_url not in visited:
+                if (
+                    normalized_url.startswith(remote_base_normalized)
+                    and normalized_url not in visited
+                ):
                     visited.add(normalized_url)
                     queue.append(sub_url)
 
@@ -147,7 +149,7 @@ def crawl_archive(
     return media_list, dir_counts
 
 
-def fetch_directory(dir_url: str) -> List[Tuple[str, str]]:
+def fetch_directory(dir_url: str) -> list[tuple[str, str]]:
     """Fetch a single remote directory listing.
 
     Returns a list of (full_url, decoded_basename) tuples.
@@ -161,7 +163,7 @@ def fetch_directory(dir_url: str) -> List[Tuple[str, str]]:
     Returns:
         List of (full_url, decoded_basename) tuples.
     """
-    out: List[Tuple[str, str]] = []
+    out: list[tuple[str, str]] = []
     try:
         html = fetch_html(dir_url)
         if not html:
@@ -233,8 +235,8 @@ def save_metadata(dir_url: str, media_meta_file: Path) -> None:
 
 
 def will_perform_full_crawl(
-    media_list: Optional[List[Tuple[str, str]]],
-    media_list_prepared: Optional[bool],
+    media_list: list[tuple[str, str]] | None,
+    media_list_prepared: bool | None,
 ) -> bool:
     """Return True when the code path would perform a full crawl.
 
@@ -256,10 +258,10 @@ def will_perform_full_crawl(
 
 
 def filter_cached_index_for_period(
-    media_list: Optional[List[Tuple[str, str]]],
-    dir_counts: Optional[Dict[str, int]],
-    periodic_dir: Optional[str],
-) -> Tuple[List[Tuple[str, str]], Dict[str, int], bool]:
+    media_list: list[tuple[str, str]] | None,
+    dir_counts: dict[str, int] | None,
+    periodic_dir: str | None,
+) -> tuple[list[tuple[str, str]], dict[str, int], bool]:
     """Return (media_list, dir_counts, prepared) filtered to period.
 
     Does not perform network I/O; simply filters provided structures
@@ -289,10 +291,10 @@ def filter_cached_index_for_period(
 
 
 def find_missing_to_append(
-    cached_media: Optional[List[Tuple[str, str]]],
-    month_items: Optional[List[Tuple[str, str]]],
+    cached_media: list[tuple[str, str]] | None,
+    month_items: list[tuple[str, str]] | None,
     periodic_dir: str,
-) -> List[Tuple[str, str]]:
+) -> list[tuple[str, str]]:
     """Return month_items that are missing from cached_media.
 
     Items are tuples (full_url, decoded_name). The returned list is in
@@ -310,7 +312,7 @@ def find_missing_to_append(
         but not in cached_media.
     """
     existing = set(cached_media or [])
-    to_append: List[Tuple[str, str]] = []
+    to_append: list[tuple[str, str]] = []
     for item in month_items or []:
         if item not in existing:
             to_append.append(item)
@@ -370,15 +372,15 @@ def is_file_too_old_for_download(
         # Convert epoch to datetime
         try:
             if epoch > 1_000_000_000_000:  # Milliseconds
-                file_date = datetime.fromtimestamp(epoch / 1000, tz=timezone.utc)
+                file_date = datetime.fromtimestamp(epoch / 1000, tz=UTC)
             else:
-                file_date = datetime.fromtimestamp(epoch, tz=timezone.utc)
+                file_date = datetime.fromtimestamp(epoch, tz=UTC)
         except (OverflowError, OSError) as e:
             logger.debug("Failed to convert epoch %s to datetime: %s", epoch, e)
             return False
 
         # Calculate age
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         age_days = (now - file_date).days
 
         return age_days > max_age_days

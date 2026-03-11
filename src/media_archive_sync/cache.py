@@ -100,14 +100,12 @@ class Cache:
             conn.execute("PRAGMA journal_mode=WAL")
         except sqlite3.Error:
             pass
-        conn.execute(
-            """
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS kv (
                 k TEXT PRIMARY KEY,
                 v TEXT
             )
-            """
-        )
+            """)
         conn.commit()
         conn.close()
 
@@ -399,6 +397,7 @@ class Cache:
 
 
 # Convenience functions for simple use cases
+
 
 def get_json(cache_dir: Path | str, key: str) -> Any | None:
     """Convenience function to get a value from SQLite cache.

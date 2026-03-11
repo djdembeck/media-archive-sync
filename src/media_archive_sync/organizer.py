@@ -19,9 +19,8 @@ import json
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Set
 
 from .logging import get_logger
 from .strings import sanitize_title_for_filename
@@ -29,7 +28,7 @@ from .strings import sanitize_title_for_filename
 logger = get_logger(__name__)
 
 
-def extract_epoch_from_name(name: str) -> Optional[int]:
+def extract_epoch_from_name(name: str) -> int | None:
     """Extract a 9-13 digit epoch timestamp from a filename.
 
     Searches for a numeric pattern in the filename, preferring values
@@ -69,7 +68,7 @@ def extract_epoch_from_name(name: str) -> Optional[int]:
     return None
 
 
-def extract_date_from_epoch(epoch: int) -> Optional[datetime]:
+def extract_date_from_epoch(epoch: int) -> datetime | None:
     """Convert an epoch timestamp to a datetime object.
 
     Handles both seconds and milliseconds since epoch.
@@ -83,7 +82,7 @@ def extract_date_from_epoch(epoch: int) -> Optional[datetime]:
     try:
         if epoch > 1_000_000_000_000:
             epoch = epoch // 1000
-        return datetime.fromtimestamp(epoch, tz=timezone.utc)
+        return datetime.fromtimestamp(epoch, tz=UTC)
     except (ValueError, OSError, OverflowError) as e:
         logger.debug("extract_date_from_epoch: failed to convert %d: %s", epoch, e)
         return None
@@ -91,9 +90,9 @@ def extract_date_from_epoch(epoch: int) -> Optional[datetime]:
 
 def load_local_files(
     local_root: Path,
-    video_extensions: Optional[Set[str]] = None,
+    video_extensions: set[str] | None = None,
     use_mtime: bool = True,
-) -> Dict[str, List[Path]]:
+) -> dict[str, list[Path]]:
     """Scan local directories and build a filename-to-paths mapping.
 
     Walks the directory tree starting from local_root, indexing all
@@ -110,7 +109,7 @@ def load_local_files(
     Returns:
         Dictionary mapping filenames to lists of Path objects.
     """
-    mapping: Dict[str, List[Path]] = {}
+    mapping: dict[str, list[Path]] = {}
 
     if not local_root.exists():
         logger.warning("Local root does not exist: %s", local_root)
@@ -170,10 +169,10 @@ def load_local_files(
 def load_local_index(
     cache_file: Path,
     local_root: Path,
-    video_extensions: Optional[Set[str]] = None,
+    video_extensions: set[str] | None = None,
     use_cache: bool = True,
-    max_cache_age: Optional[int] = 3600,
-) -> Dict[str, List[Path]]:
+    max_cache_age: int | None = 3600,
+) -> dict[str, list[Path]]:
     """Load or build a cached index of local files.
 
     Attempts to load from JSON cache first; if unavailable or stale,
@@ -194,11 +193,13 @@ def load_local_index(
             cache_stat = cache_file.stat()
             cache_age = time.time() - cache_stat.st_mtime
             if max_cache_age is not None and cache_age > max_cache_age:
-                logger.debug("Cache is stale (age=%.0fs, max=%ds)", cache_age, max_cache_age)
+                logger.debug(
+                    "Cache is stale (age=%.0fs, max=%ds)", cache_age, max_cache_age
+                )
             else:
                 with cache_file.open("r", encoding="utf-8") as f:
                     data = json.load(f)
-                mapping: Dict[str, List[Path]] = {}
+                mapping: dict[str, list[Path]] = {}
                 for k, v in data.items():
                     if isinstance(v, list):
                         mapping[k] = [Path(p) for p in v]
@@ -230,11 +231,11 @@ def load_local_index(
 
 def organize_files_by_month(
     local_root: Path,
-    files: Optional[Dict[str, List[Path]]] = None,
+    files: dict[str, list[Path]] | None = None,
     month_format: str = "%b_%Y",
-    video_extensions: Optional[Set[str]] = None,
+    video_extensions: set[str] | None = None,
     dry_run: bool = False,
-) -> Dict[str, List[Path]]:
+) -> dict[str, list[Path]]:
     """Organize files into month-based folders.
 
     Groups files by the month extracted from their epoch timestamp,
@@ -254,7 +255,7 @@ def organize_files_by_month(
     if files is None:
         files = load_local_files(local_root, video_extensions)
 
-    organized: Dict[str, List[Path]] = {}
+    organized: dict[str, list[Path]] = {}
 
     for filename, filepath_list in files.items():
         for filepath in filepath_list:
@@ -267,7 +268,9 @@ def organize_files_by_month(
             # Convert to datetime
             dt = extract_date_from_epoch(epoch)
             if not dt:
-                logger.debug("Could not extract date from epoch %d: %s", epoch, filename)
+                logger.debug(
+                    "Could not extract date from epoch %d: %s", epoch, filename
+                )
                 continue
 
             # Format month folder name
@@ -279,24 +282,30 @@ def organize_files_by_month(
             organized[month_folder].append(filepath)
 
     if dry_run:
-        logger.info("[DRY-RUN] Would organize %d files into %d month folders:",
-                    sum(len(v) for v in organized.values()), len(organized))
+        logger.info(
+            "[DRY-RUN] Would organize %d files into %d month folders:",
+            sum(len(v) for v in organized.values()),
+            len(organized),
+        )
         for month, file_list in sorted(organized.items()):
             logger.info("  %s: %d files", month, len(file_list))
     else:
-        logger.info("Organized %d files into %d month folders",
-                    sum(len(v) for v in organized.values()), len(organized))
+        logger.info(
+            "Organized %d files into %d month folders",
+            sum(len(v) for v in organized.values()),
+            len(organized),
+        )
 
     return organized
 
 
 def get_target_path(
     filename: str,
-    title: Optional[str] = None,
+    title: str | None = None,
     local_root: Path = Path("./media"),
     month_format: str = "%b_%Y",
-    video_extensions: Optional[Set[str]] = None,
-) -> Optional[Path]:
+    video_extensions: set[str] | None = None,
+) -> Path | None:
     """Calculate the organized target path for a file.
 
     Given a filename (which should contain an epoch), determine where

@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Iterable
 from contextlib import contextmanager
-from typing import Any, Iterable, Optional, TextIO, Union
+from typing import Any, TextIO
+
 
 class _DummyTqdm:
     def __init__(self, iterable=None, *, desc=None, total=None, **kwargs):
@@ -58,13 +60,14 @@ except ImportError:
 try:
     from rich.console import Console
     from rich.progress import (
+        BarColumn,
         Progress,
         SpinnerColumn,
-        BarColumn,
-        TimeRemainingColumn,
-        TextColumn,
         TaskID,
+        TextColumn,
+        TimeRemainingColumn,
     )
+
     RICH_AVAILABLE = True
 except ImportError:
     RICH_AVAILABLE = False
@@ -83,14 +86,14 @@ def _stderr_is_tty() -> bool:
 
 
 def tqdm_or_stderr(
-    iterable: Optional[Iterable] = None,
-    desc: Optional[str] = None,
-    total: Optional[int] = None,
+    iterable: Iterable | None = None,
+    desc: str | None = None,
+    total: int | None = None,
     leave: bool = True,
-    file: Optional[TextIO] = None,
-    disable: Optional[bool] = None,
+    file: TextIO | None = None,
+    disable: bool | None = None,
     unit: str = "it",
-    unit_scale: Union[bool, int, float] = False,
+    unit_scale: bool | int | float = False,
     **kwargs,
 ):
     """tqdm wrapper that writes to stderr and respects FORCE_PROGRESS.
@@ -132,8 +135,8 @@ class _TqdmProgressWrapper:
 
     def __init__(
         self,
-        desc: Optional[str] = None,
-        total: Optional[int] = None,
+        desc: str | None = None,
+        total: int | None = None,
         disable: bool = False,
         unit: str = "items",
     ):
@@ -141,10 +144,10 @@ class _TqdmProgressWrapper:
         self.total = total
         self.disable = disable
         self.unit = unit
-        self._pbar: Optional[Any] = None
+        self._pbar: Any | None = None
         self.n = 0
 
-    def __enter__(self) -> "_TqdmProgressWrapper":
+    def __enter__(self) -> _TqdmProgressWrapper:
         self._pbar = tqdm_or_stderr(
             desc=self.desc,
             total=self.total,
@@ -182,13 +185,14 @@ class _TqdmProgressWrapper:
 
 
 if RICH_AVAILABLE:
+
     class _RichProgressWrapper:
         """Wrapper providing a consistent interface for Rich-based progress."""
 
         def __init__(
             self,
-            desc: Optional[str] = None,
-            total: Optional[int] = None,
+            desc: str | None = None,
+            total: int | None = None,
             disable: bool = False,
             unit: str = "items",
         ):
@@ -196,11 +200,11 @@ if RICH_AVAILABLE:
             self.total = total
             self.disable = disable
             self.unit = unit
-            self._progress: Optional[Progress] = None
-            self._task_id: Optional[TaskID] = None
+            self._progress: Progress | None = None
+            self._task_id: TaskID | None = None
             self.n = 0
 
-        def __enter__(self) -> "_RichProgressWrapper":
+        def __enter__(self) -> _RichProgressWrapper:
             if not self.disable:
                 self._progress = Progress(
                     SpinnerColumn(),
@@ -212,9 +216,7 @@ if RICH_AVAILABLE:
                     disable=self.disable or NO_COLOR,
                 )
                 self._progress.start()
-                self._task_id = self._progress.add_task(
-                    self.desc, total=self.total
-                )
+                self._task_id = self._progress.add_task(self.desc, total=self.total)
             return self
 
         def __exit__(self, *exc) -> bool:
@@ -248,9 +250,9 @@ if RICH_AVAILABLE:
 
 
 def rich_progress_or_stderr(
-    desc: Optional[str] = None,
-    total: Optional[int] = None,
-    disable: Optional[bool] = None,
+    desc: str | None = None,
+    total: int | None = None,
+    disable: bool | None = None,
     unit: str = "items",
 ) -> Any:
     """Returns a Rich-based progress context manager if available, otherwise tqdm.
@@ -288,8 +290,8 @@ def rich_progress_or_stderr(
 @contextmanager
 def simple_progress(
     desc: str = "Processing",
-    total: Optional[int] = None,
-    disable: Optional[bool] = None,
+    total: int | None = None,
+    disable: bool | None = None,
 ):
     """Simple context manager for progress tracking.
 
@@ -340,4 +342,3 @@ __all__ = [
     "safe_print",
     "FORCE_PROGRESS",
 ]
-

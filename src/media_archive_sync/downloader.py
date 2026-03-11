@@ -10,18 +10,18 @@ This module provides generic file download functionality with support for:
 from __future__ import annotations
 
 import concurrent.futures
-import os
 import signal
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any
 
 import requests
 from requests.adapters import HTTPAdapter
 
 from .config import ArchiveConfig
-from .display import rich_progress_or_stderr, safe_print
+from .display import rich_progress_or_stderr
 from .logging import get_logger
 
 logger = get_logger(__name__)
@@ -39,10 +39,10 @@ def download_file(
     timeout: int = DEFAULT_TIMEOUT,
     resume: bool = True,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
-    progress_callback: Optional[Callable[[int, int], None]] = None,
-    stop_event: Optional[threading.Event] = None,
-    session: Optional[requests.Session] = None,
-) -> Tuple[bool, int]:
+    progress_callback: Callable[[int, int], None] | None = None,
+    stop_event: threading.Event | None = None,
+    session: requests.Session | None = None,
+) -> tuple[bool, int]:
     """Download a single file from URL to local path.
 
     Supports resumable downloads via HTTP Range requests. Writes to a
@@ -64,7 +64,7 @@ def download_file(
     temp_path = local_path.with_suffix(local_path.suffix + ".partial")
     temp_path.parent.mkdir(parents=True, exist_ok=True)
 
-    headers: Dict[str, str] = {}
+    headers: dict[str, str] = {}
     start_byte = 0
 
     # Check for existing partial file for resuming
@@ -83,7 +83,9 @@ def download_file(
             session.mount("https://", HTTPAdapter(max_retries=1))
 
         with session:  # Context manager ensures session.close() on exit
-            with session.get(url, stream=True, timeout=timeout, headers=headers) as response:
+            with session.get(
+                url, stream=True, timeout=timeout, headers=headers
+            ) as response:
                 if response.status_code == 416:
                     try:
                         head = session.head(url, timeout=timeout, allow_redirects=True)
@@ -95,7 +97,16 @@ def download_file(
                     except Exception:
                         pass
                     temp_path.unlink(missing_ok=True)
-                    return download_file(url, local_path, timeout, False, chunk_size, progress_callback, _stop_event, session)
+                    return download_file(
+                        url,
+                        local_path,
+                        timeout,
+                        False,
+                        chunk_size,
+                        progress_callback,
+                        _stop_event,
+                        session,
+                    )
 
                 response.raise_for_status()
 
@@ -138,7 +149,7 @@ def download_file(
 
 
 def download_files(
-    media_list: List[Tuple[str, Path]],
+    media_list: list[tuple[str, Path]],
     workers: int = 3,
     skip_existing: bool = True,
     partial_ext: str = ".partial",
@@ -147,12 +158,12 @@ def download_files(
     retry_backoff: float = DEFAULT_RETRY_BACKOFF,
     progress_desc: str = "Downloading",
     disable_progress: bool = False,
-    stop_event: Optional[threading.Event] = None,
-    active_sessions: Optional[set] = None,
-    sessions_lock: Optional[threading.Lock] = None,
-    partials: Optional[set[Path]] = None,
-    partials_lock: Optional[threading.Lock] = None,
-) -> Tuple[int, int, int, List[Path]]:
+    stop_event: threading.Event | None = None,
+    active_sessions: set | None = None,
+    sessions_lock: threading.Lock | None = None,
+    partials: set[Path] | None = None,
+    partials_lock: threading.Lock | None = None,
+) -> tuple[int, int, int, list[Path]]:
     """Download multiple files using a thread pool.
 
     Args:
@@ -183,7 +194,7 @@ def download_files(
     success_count = 0
     skip_count = 0
     fail_count = 0
-    downloaded_paths: List[Path] = []
+    downloaded_paths: list[Path] = []
 
     _stop_event = stop_event or threading.Event()
     _active_sessions = active_sessions if active_sessions is not None else set()
@@ -191,7 +202,7 @@ def download_files(
     _partials = partials if partials is not None else set()
     _partials_lock = partials_lock or threading.Lock()
 
-    def worker(item: Tuple[str, Path]) -> Tuple[bool, bool]:
+    def worker(item: tuple[str, Path]) -> tuple[bool, bool]:
         """Download a single file. Returns (success, skipped)."""
         url, local_path = item
         session = None
@@ -233,7 +244,7 @@ def download_files(
                     _active_sessions.add(session)
 
                 # Check for resume capability
-                headers: Dict[str, str] = {}
+                headers: dict[str, str] = {}
                 start_byte = 0
                 if temp_path.is_file():
                     start_byte = temp_path.stat().st_size
@@ -260,7 +271,9 @@ def download_files(
                         _partials.add(temp_path)
 
                     with open(temp_path, mode) as f:
-                        for chunk in response.iter_content(chunk_size=DEFAULT_CHUNK_SIZE):
+                        for chunk in response.iter_content(
+                            chunk_size=DEFAULT_CHUNK_SIZE
+                        ):
                             if _stop_event.is_set():
                                 raise KeyboardInterrupt()
                             if chunk:
@@ -285,7 +298,9 @@ def download_files(
                 if attempt < max_retries:
                     time.sleep(retry_backoff * attempt)
                 else:
-                    logger.error("Download failed after %d retries: %s", max_retries, url)
+                    logger.error(
+                        "Download failed after %d retries: %s", max_retries, url
+                    )
             except KeyboardInterrupt:
                 logger.info("Download interrupted: %s", url)
                 return False, False
@@ -331,7 +346,7 @@ def download_files(
             desc=progress_desc, total=total, disable=disable_progress, unit="files"
         ) as pbar:
 
-            def worker_with_progress(item: Tuple[str, Path]) -> Tuple[bool, bool]:
+            def worker_with_progress(item: tuple[str, Path]) -> tuple[bool, bool]:
                 result = worker(item)
                 pbar.update(1)
                 return result
@@ -358,7 +373,10 @@ def download_files(
                         fail_count += 1
 
     finally:
-        if old_handler is not None and threading.current_thread() is threading.main_thread():
+        if (
+            old_handler is not None
+            and threading.current_thread() is threading.main_thread()
+        ):
             signal.signal(signal.SIGINT, old_handler)
 
     return success_count, skip_count, fail_count, downloaded_paths
@@ -373,8 +391,8 @@ class DownloadManager:
 
     def __init__(
         self,
-        config: Optional[ArchiveConfig] = None,
-        progress_callback: Optional[Callable[[str, int, int], None]] = None,
+        config: ArchiveConfig | None = None,
+        progress_callback: Callable[[str, int, int], None] | None = None,
     ):
         """Initialize the download manager.
 
@@ -395,7 +413,7 @@ class DownloadManager:
         url: str,
         local_path: Path,
         resume: bool = True,
-    ) -> Tuple[bool, int]:
+    ) -> tuple[bool, int]:
         """Download a single file.
 
         Args:
@@ -409,8 +427,10 @@ class DownloadManager:
         if self._stop_event.is_set():
             return False, 0
 
-        session: Optional[requests.Session] = None
-        temp_path = local_path.with_suffix(local_path.suffix + self.config.partial_extension)
+        session: requests.Session | None = None
+        temp_path = local_path.with_suffix(
+            local_path.suffix + self.config.partial_extension
+        )
 
         try:
             with self._sessions_lock:
@@ -422,7 +442,7 @@ class DownloadManager:
                 self._partials.add(temp_path)
 
             # Wrap progress callback to include filename
-            wrapped_callback: Optional[Callable[[int, int], None]] = None
+            wrapped_callback: Callable[[int, int], None] | None = None
             if self.progress_callback:
 
                 def wrapped(bytes_done: int, total: int) -> None:
@@ -449,9 +469,9 @@ class DownloadManager:
 
     def download_batch(
         self,
-        media_list: List[Tuple[str, Path]],
+        media_list: list[tuple[str, Path]],
         progress_desc: str = "Downloading",
-    ) -> Tuple[int, int, int, List[Path]]:
+    ) -> tuple[int, int, int, list[Path]]:
         """Download a batch of files.
 
         Args:
@@ -491,7 +511,7 @@ class DownloadManager:
                 except Exception:
                     pass
 
-    def __enter__(self) -> "DownloadManager":
+    def __enter__(self) -> DownloadManager:
         """Context manager entry."""
         return self
 
@@ -502,10 +522,10 @@ class DownloadManager:
 
 
 def download_with_config(
-    media_list: List[Tuple[str, Path]],
+    media_list: list[tuple[str, Path]],
     config: ArchiveConfig,
     progress_desc: str = "Downloading",
-) -> Tuple[int, int, int, List[Path]]:
+) -> tuple[int, int, int, list[Path]]:
     """Download files using ArchiveConfig settings.
 
     Convenience function that creates a DownloadManager with the given

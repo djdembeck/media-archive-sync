@@ -9,39 +9,22 @@ from . import ArchiveConfig, crawl_archive, download_with_config
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Download media from web archives"
+    parser = argparse.ArgumentParser(description="Download media from web archives")
+    parser.add_argument("--remote", required=True, help="Remote archive URL")
+    parser.add_argument(
+        "--local", default="./media", help="Local download path (default: ./media)"
     )
     parser.add_argument(
-        "--remote",
-        required=True,
-        help="Remote archive URL"
+        "--workers", type=int, default=3, help="Number of download workers (default: 3)"
     )
     parser.add_argument(
-        "--local",
-        default="./media",
-        help="Local download path (default: ./media)"
+        "--dry-run", action="store_true", help="Preview only, don't download"
     )
     parser.add_argument(
-        "--workers",
-        type=int,
-        default=3,
-        help="Number of download workers (default: 3)"
+        "--organize", action="store_true", help="Organize files by month after download"
     )
     parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Preview only, don't download"
-    )
-    parser.add_argument(
-        "--organize",
-        action="store_true",
-        help="Organize files by month after download"
-    )
-    parser.add_argument(
-        "--quiet",
-        action="store_true",
-        help="Suppress non-essential output"
+        "--quiet", action="store_true", help="Suppress non-essential output"
     )
 
     args = parser.parse_args()
@@ -74,13 +57,17 @@ def main():
 
     if not args.dry_run:
         download_with_config(
-            media_list=[(url, _compute_target_path(url, config.local_root)) for url, name in media_list],
+            media_list=[
+                (url, _compute_target_path(url, config.local_root))
+                for url, name in media_list
+            ],
             config=config,
         )
 
     # Organize
     if args.organize:
         from .organizer import organize_files_by_month
+
         organized = organize_files_by_month(
             local_root=config.local_root,
             month_format=config.month_folder_format,
@@ -88,6 +75,7 @@ def main():
         )
         if not args.dry_run:
             import shutil
+
             for month_folder, file_list in organized.items():
                 target_dir = config.local_root / month_folder
                 target_dir.mkdir(parents=True, exist_ok=True)

@@ -2,6 +2,7 @@
 """Basic example: Download all files from an archive."""
 
 from pathlib import Path
+
 from media_archive_sync import ArchiveConfig, crawl_archive, download_files
 
 # Configure

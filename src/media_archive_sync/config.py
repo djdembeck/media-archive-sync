@@ -2,7 +2,6 @@
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Set
 
 
 @dataclass
@@ -17,7 +16,9 @@ class ArchiveConfig:
     max_depth: int = 4
 
     # File types
-    video_extensions: Set[str] = field(default_factory=lambda: {".mp4", ".mkv", ".avi", ".mov", ".webm"})
+    video_extensions: set[str] = field(
+        default_factory=lambda: {".mp4", ".mkv", ".avi", ".mov", ".webm"}
+    )
 
     # Organization
     month_folder_format: str = "%b_%Y"  # e.g., "jan_2026"
@@ -25,7 +26,7 @@ class ArchiveConfig:
 
     # Naming
     sanitize_replacements: dict = field(default_factory=dict)
-    strip_tokens: Set[str] = field(default_factory=set)  # e.g., {"gg", "tts"}
+    strip_tokens: set[str] = field(default_factory=set)  # e.g., {"gg", "tts"}
 
     # Downloads
     workers: int = 3
@@ -33,7 +34,7 @@ class ArchiveConfig:
     partial_extension: str = ".partial"
 
     # Cache
-    cache_dir: Optional[Path] = None
+    cache_dir: Path | None = None
     cache_backend: str = "sqlite"  # "sqlite" or "json"
 
     # NFO

@@ -81,7 +81,16 @@ coverage = [
 ]
 
 # Combine defaults + coverage
-addopts = defaults + coverage
+addopts = [
+    "-ra",              # Show summary of all test outcomes
+    "-q",               # Quiet mode
+    "--strict-markers", # Fail on unknown markers
+    "--tb=short",       # Short traceback format
+    "--disable-warnings",  # Disable warnings
+    "--cov=src/media_archive_sync",
+    "--cov-report=xml",
+    "--cov-report=term-missing",
+]
 
 # Timeout for tests (30 seconds default, can be overridden with --timeout)
 timeout = 30

@@ -2,10 +2,11 @@
 """Advanced example: Custom organization with NFO generation."""
 
 from pathlib import Path
+
 from media_archive_sync import (
-    ArchiveConfig, 
-    crawl_archive, 
+    ArchiveConfig,
     DownloadManager,
+    crawl_archive,
 )
 
 config = ArchiveConfig(
@@ -24,6 +25,7 @@ downloader.download_batch(media_list)
 
 # Organize and create NFOs
 from media_archive_sync.organizer import organize_files_by_month
+
 organize_files_by_month(
     config.local_root,
     config.month_folder_format,

@@ -4,21 +4,18 @@ This module provides functions to generate and write Kodi-compatible NFO XML
 files from media metadata dictionaries.
 """
 
-from datetime import datetime, timezone
-from xml.etree import ElementTree as ET
-from typing import Dict, Optional
-import ast
-import re
-from pathlib import Path
-import os
 import html
+import re
+from datetime import UTC, datetime
+from pathlib import Path
+from xml.etree import ElementTree as ET
 
 from .logging import get_logger
 
 logger = get_logger(__name__)
 
 
-def parse_release_date(candidate) -> Optional[str]:
+def parse_release_date(candidate) -> str | None:
     """Parse a date candidate into ISO format (YYYY-MM-DD).
 
     Attempts multiple parsing strategies in order:
@@ -42,7 +39,7 @@ def parse_release_date(candidate) -> Optional[str]:
         if 1e9 < val < 1e12:
             if val > 1e11:
                 val = val / 1000.0
-            dt = datetime.fromtimestamp(val, tz=timezone.utc)
+            dt = datetime.fromtimestamp(val, tz=UTC)
             return dt.date().isoformat()
     except (ValueError, TypeError, OverflowError):
         pass
@@ -63,7 +60,9 @@ def parse_release_date(candidate) -> Optional[str]:
         if len(s2) >= 10:
             candidate_date = s2[:10]
             # Validate YYYY-MM-DD format
-            if re.match(r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$", candidate_date):
+            if re.match(
+                r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$", candidate_date
+            ):
                 return candidate_date
     except (ValueError, TypeError):
         pass
@@ -73,17 +72,17 @@ def parse_release_date(candidate) -> Optional[str]:
 
 def build_movie_nfo(
     title: str,
-    year: Optional[int] = None,
-    plot: Optional[str] = None,
-    director: Optional[str] = None,
-    actors: Optional[list] = None,
-    genres: Optional[list] = None,
-    runtime: Optional[int] = None,
-    rating: Optional[float] = None,
-    original_title: Optional[str] = None,
-    releasedate: Optional[str] = None,
-    collections: Optional[list] = None,
-    uniqueid: Optional[Dict[str, str]] = None,
+    year: int | None = None,
+    plot: str | None = None,
+    director: str | None = None,
+    actors: list | None = None,
+    genres: list | None = None,
+    runtime: int | None = None,
+    rating: float | None = None,
+    original_title: str | None = None,
+    releasedate: str | None = None,
+    collections: list | None = None,
+    uniqueid: dict[str, str] | None = None,
 ) -> str:
     """Build an NFO XML string from media metadata.
 
@@ -110,7 +109,7 @@ def build_movie_nfo(
     """
     movie = ET.Element("movie")
 
-    def _add_text(tag: str, text: Optional[str]):
+    def _add_text(tag: str, text: str | None):
         """Add a text subelement if text is not empty."""
         if text is None:
             return
@@ -238,7 +237,7 @@ def write_nfo_for_path(video_path, nfo_data: str, overwrite: bool = False) -> bo
                 if existing == nfo_data:
                     logger.debug("NFO unchanged, skipping: %s", p)
                     return False
-            except (OSError, IOError):
+            except OSError:
                 # If we can't read the existing file, skip to be safe
                 logger.debug("Cannot read existing NFO, skipping: %s", p)
                 return False

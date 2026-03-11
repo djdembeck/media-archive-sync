@@ -6,7 +6,6 @@ making them easy to test and reuse across the codebase.
 
 import re
 import urllib.parse
-from typing import Optional, Set
 
 
 def urldecode(url: str) -> str:
@@ -40,9 +39,24 @@ def normalise_string(s: str) -> str:
     if not s or not isinstance(s, str):
         return ""
 
-    # If this looks like a filename with an extension, strip the extension
-    if re.search(r"\.[A-Za-z0-9]{1,6}$", s):
-        s = s.rsplit(".", 1)[0]
+    # Common video file extensions to strip when normalizing filenames
+    video_extensions = {
+        "mp4",
+        "mkv",
+        "avi",
+        "mov",
+        "webm",
+        "m4v",
+        "mpg",
+        "mpeg",
+        "flv",
+        "wmv",
+    }
+    # Check if string ends with a known video extension
+    if "." in s:
+        ext = s.rsplit(".", 1)[1].lower()
+        if ext in video_extensions:
+            s = s.rsplit(".", 1)[0]
 
     # Replace punctuation with spaces so separators (.,-, etc.) become word
     # boundaries instead of being removed and gluing words together.
@@ -53,7 +67,7 @@ def normalise_string(s: str) -> str:
     return s.lower().strip()
 
 
-def _strip_bang_tokens(title: str, tokens: Optional[Set[str]] = None) -> str:
+def _strip_bang_tokens(title: str, tokens: set[str] | None = None) -> str:
     """Remove bang operator tokens like '!gg', '!tts', '!ad' and trailing
     '!tag' suffixes (case-insensitive).
 
@@ -110,8 +124,8 @@ def _strip_bang_tokens(title: str, tokens: Optional[Set[str]] = None) -> str:
 
 def sanitize_title_for_filename(
     title: str,
-    replacements: Optional[dict] = None,
-    strip_tokens: Optional[Set[str]] = None,
+    replacements: dict | None = None,
+    strip_tokens: set[str] | None = None,
 ) -> str:
     """Sanitize a title into a safe filename fragment.
 
