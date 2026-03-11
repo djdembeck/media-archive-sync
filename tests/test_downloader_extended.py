@@ -189,10 +189,13 @@ class TestDownloadFileExtended:
         mock_session = MagicMock()
         mock_session.get.return_value = mock_response
 
-        with patch(
-            "media_archive_sync.downloader.requests.Session",
-            return_value=mock_session,
-        ), patch("builtins.open", side_effect=OSError("Disk full")):
+        with (
+            patch(
+                "media_archive_sync.downloader.requests.Session",
+                return_value=mock_session,
+            ),
+            patch("builtins.open", side_effect=OSError("Disk full")),
+        ):
             result = download_file(url, local_path)
 
         assert result[0] is False
@@ -301,15 +304,16 @@ class TestDownloadFilesExtended:
         mock_session = MagicMock()
         mock_session.get.return_value = mock_response
 
-        with patch(
-            "media_archive_sync.downloader.requests.Session",
-            return_value=mock_session,
-        ), patch(
-            "media_archive_sync.downloader.rich_progress_or_stderr"
-        ) as mock_progress:
-            mock_progress.return_value.__enter__ = MagicMock(
-                return_value=MagicMock()
-            )
+        with (
+            patch(
+                "media_archive_sync.downloader.requests.Session",
+                return_value=mock_session,
+            ),
+            patch(
+                "media_archive_sync.downloader.rich_progress_or_stderr"
+            ) as mock_progress,
+        ):
+            mock_progress.return_value.__enter__ = MagicMock(return_value=MagicMock())
             mock_progress.return_value.__exit__ = MagicMock(return_value=False)
 
             result = download_files(
@@ -375,13 +379,14 @@ class TestDownloadManagerExtended:
         mock_session.get.return_value = mock_response
 
         result = (False, 0)
-        with patch(
-            "media_archive_sync.downloader.requests.Session",
-            return_value=mock_session,
-        ), DownloadManager(config) as manager:
-            result = manager.download_single(
-                "http://example.com/video.mp4", local_path
-            )
+        with (
+            patch(
+                "media_archive_sync.downloader.requests.Session",
+                return_value=mock_session,
+            ),
+            DownloadManager(config) as manager,
+        ):
+            result = manager.download_single("http://example.com/video.mp4", local_path)
 
         assert result[0] is True
 
@@ -505,10 +510,13 @@ class TestDownloadManagerExtended:
         mock_session = MagicMock()
         mock_session.get.return_value = mock_response
 
-        with patch(
-            "media_archive_sync.downloader.requests.Session",
-            return_value=mock_session,
-        ), patch.object(threading, "current_thread") as mock_current:
+        with (
+            patch(
+                "media_archive_sync.downloader.requests.Session",
+                return_value=mock_session,
+            ),
+            patch.object(threading, "current_thread") as mock_current,
+        ):
             mock_thread = MagicMock()
             mock_thread.return_value = MagicMock()
             mock_thread.return_value.name = "MainThread"
@@ -531,7 +539,7 @@ class TestDownloadCancelledError:
         except DownloadCancelledError:
             assert True
             return
-        assert False, "Exception should have been caught"
+        raise AssertionError("Exception should have been caught")
 
     def test_exception_inheritance(self):
         """Test exception inheritance."""

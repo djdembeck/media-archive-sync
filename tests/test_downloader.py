@@ -25,7 +25,7 @@ class TestDownloadCancelledError:
         except DownloadCancelledError:
             assert True
             return
-        assert False, "DownloadCancelledError should have been caught"
+        raise AssertionError("DownloadCancelledError should have been caught")
 
 
 class TestDownloadFileCancellation:

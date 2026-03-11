@@ -314,11 +314,8 @@ def simple_progress(
         ...         p.update(1)
     """
     progress = rich_progress_or_stderr(desc=desc, total=total, disable=disable)
-    try:
-        with progress as p:
-            yield p
-    finally:
-        pass
+    with progress as p:
+        yield p
 
 
 def safe_print(message: str, *args) -> None:

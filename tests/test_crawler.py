@@ -101,9 +101,11 @@ class TestSaveMetadata:
         }
         mock_response.content = b"<html>test</html>"
 
-        with patch("requests.head", return_value=mock_response):
-            with patch("requests.get", return_value=mock_response):
-                save_metadata("http://example.com/dir/", meta_file)
+        with (
+            patch("requests.head", return_value=mock_response),
+            patch("requests.get", return_value=mock_response),
+        ):
+            save_metadata("http://example.com/dir/", meta_file)
 
         content = json.loads(meta_file.read_text())
         assert "http://example.com/dir/" in content
@@ -119,9 +121,11 @@ class TestSaveMetadata:
         mock_response.headers = {}
         mock_response.content = b"<html>test</html>"
 
-        with patch("requests.head", return_value=mock_response):
-            with patch("requests.get", return_value=mock_response):
-                save_metadata("http://example.com/dir/", meta_file)
+        with (
+            patch("requests.head", return_value=mock_response),
+            patch("requests.get", return_value=mock_response),
+        ):
+            save_metadata("http://example.com/dir/", meta_file)
 
         content = json.loads(meta_file.read_text())
         assert "http://example.com/dir/" in content
@@ -136,9 +140,11 @@ class TestSaveMetadata:
         mock_response.headers = {}
         mock_response.content = b"<html>test</html>"
 
-        with patch("requests.head", return_value=mock_response):
-            with patch("requests.get", return_value=mock_response):
-                save_metadata("http://example.com/dir/", meta_file)
+        with (
+            patch("requests.head", return_value=mock_response),
+            patch("requests.get", return_value=mock_response),
+        ):
+            save_metadata("http://example.com/dir/", meta_file)
 
         content = json.loads(meta_file.read_text())
         assert isinstance(content, dict)
@@ -153,9 +159,11 @@ class TestSaveMetadata:
         mock_response.headers = {"ETag": '"abc123"'}
         mock_response.content = b"<html>test</html>"
 
-        with patch("requests.head", return_value=mock_response):
-            with patch("requests.get", return_value=mock_response):
-                save_metadata("http://example.com/dir/", meta_file)
+        with (
+            patch("requests.head", return_value=mock_response),
+            patch("requests.get", return_value=mock_response),
+        ):
+            save_metadata("http://example.com/dir/", meta_file)
 
         assert meta_file.exists()
         content = json.loads(meta_file.read_text())
@@ -190,7 +198,11 @@ class TestFetchHtml:
 
     def test_fetch_html_network_error(self):
         """Test handling network errors."""
-        with patch("requests.get", side_effect=Exception("Connection failed")):
+        import requests
+
+        with patch(
+            "requests.get", side_effect=requests.RequestException("Connection failed")
+        ):
             result = fetch_html("http://example.com/")
 
         assert result == ""
@@ -430,7 +442,7 @@ class TestCrawlArchive:
             callback_calls.append((dir_url, depth))
 
         with patch("media_archive_sync.crawler.fetch_html", return_value=html):
-            result = crawl_archive(
+            crawl_archive(
                 remote_base="http://example.com/",
                 progress_callback=progress_callback,
             )

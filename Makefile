@@ -24,7 +24,7 @@ test-cov:
 	pytest --cov=src/media_archive_sync --cov-report=term-missing --cov-fail-under=80
 
 lint:
-	ruff check --fix src/
+	ruff check --fix src/ tests/
 
 format:
 	black src/ tests/

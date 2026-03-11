@@ -53,11 +53,13 @@ class TestTqdmOrStderrExtended:
 
     def test_tqdm_or_stderr_force_progress(self):
         """Test FORCE_PROGRESS flag."""
-        with patch("media_archive_sync.display.FORCE_PROGRESS", True):
-            with patch("media_archive_sync.display._stderr_is_tty", return_value=False):
-                items = [1, 2, 3]
-                result = list(tqdm_or_stderr(items, total=3))
-                assert result == items
+        with (
+            patch("media_archive_sync.display.FORCE_PROGRESS", True),
+            patch("media_archive_sync.display._stderr_is_tty", return_value=False),
+        ):
+            items = [1, 2, 3]
+            result = list(tqdm_or_stderr(items, total=3))
+            assert result == items
 
     def test_tqdm_or_stderr_with_custom_file(self):
         """Test with custom file parameter."""
@@ -78,10 +80,12 @@ class TestRichProgressExtended:
 
     def test_rich_progress_with_rich_available(self):
         """Test when Rich is available."""
-        with patch("media_archive_sync.display.RICH_AVAILABLE", True):
-            with patch("media_archive_sync.display._stderr_is_tty", return_value=True):
-                progress = rich_progress_or_stderr(desc="Test", total=10)
-                assert progress is not None
+        with (
+            patch("media_archive_sync.display.RICH_AVAILABLE", True),
+            patch("media_archive_sync.display._stderr_is_tty", return_value=True),
+        ):
+            progress = rich_progress_or_stderr(desc="Test", total=10)
+            assert progress is not None
 
 
 class TestDummyTqdmExtended:

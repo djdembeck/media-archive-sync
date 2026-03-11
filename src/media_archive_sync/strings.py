@@ -99,7 +99,8 @@ def _strip_bang_tokens(title: str, tokens: set[str] | None = None) -> str:
             idx = p.rfind("!")
             prefix = p[:idx]
             suffix = p[idx + 1 :]
-            is_known = suffix.lower() in bang_tokens or suffix.islower()
+            # Only strip explicit bang tokens, not all lowercase suffixes
+            is_known = suffix.lower() in bang_tokens
             if suffix and is_known:
                 if prefix:
                     parts.append(prefix)
@@ -109,8 +110,6 @@ def _strip_bang_tokens(title: str, tokens: set[str] | None = None) -> str:
         if p.startswith("!"):
             tag = p[1:]
             if tag.lower() in bang_tokens:
-                continue
-            if tag.islower():
                 continue
             # Keep bang-prefixed tokens when they are at the start or
             # when they are not the final token; otherwise drop trailing

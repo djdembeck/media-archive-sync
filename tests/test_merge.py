@@ -175,14 +175,15 @@ class TestMergeVideoParts:
         part1.write_text("fake video content")
         output = tmp_path / "output.mp4"
 
-        with patch("subprocess.run") as mock_run, patch(
-            "media_archive_sync.merge.get_video_duration", return_value=10.0
-        ), patch(
-            "media_archive_sync.merge._resolve_ffprobe_path",
-            return_value="ffprobe",
-        ), patch(
-            "media_archive_sync.merge._create_concat_list"
-        ) as mock_concat:
+        with (
+            patch("subprocess.run") as mock_run,
+            patch("media_archive_sync.merge.get_video_duration", return_value=10.0),
+            patch(
+                "media_archive_sync.merge._resolve_ffprobe_path",
+                return_value="ffprobe",
+            ),
+            patch("media_archive_sync.merge._create_concat_list") as mock_concat,
+        ):
             mock_concat.return_value = tmp_path / "concat.txt"
             mock_run.return_value = MagicMock(returncode=0)
 
@@ -199,11 +200,13 @@ class TestMergeVideoParts:
         part1.write_text("fake video content")
         output = tmp_path / "output.mp4"
 
-        with patch("subprocess.run") as mock_run, patch(
-            "media_archive_sync.merge._resolve_ffprobe_path", return_value="ffprobe"
-        ), patch(
-            "media_archive_sync.merge._create_concat_list"
-        ) as mock_concat:
+        with (
+            patch("subprocess.run") as mock_run,
+            patch(
+                "media_archive_sync.merge._resolve_ffprobe_path", return_value="ffprobe"
+            ),
+            patch("media_archive_sync.merge._create_concat_list") as mock_concat,
+        ):
             mock_concat.return_value = tmp_path / "concat.txt"
             mock_run.side_effect = subprocess.CalledProcessError(1, "ffmpeg")
 
@@ -217,11 +220,13 @@ class TestMergeVideoParts:
         part1.write_text("fake video content")
         output = tmp_path / "output.mp4"
 
-        with patch("subprocess.run") as mock_run, patch(
-            "media_archive_sync.merge._resolve_ffprobe_path", return_value="ffprobe"
-        ), patch(
-            "media_archive_sync.merge._create_concat_list"
-        ) as mock_concat:
+        with (
+            patch("subprocess.run") as mock_run,
+            patch(
+                "media_archive_sync.merge._resolve_ffprobe_path", return_value="ffprobe"
+            ),
+            patch("media_archive_sync.merge._create_concat_list") as mock_concat,
+        ):
             mock_concat.return_value = tmp_path / "concat.txt"
             mock_run.side_effect = FileNotFoundError("ffmpeg not found")
 
@@ -237,14 +242,15 @@ class TestMergeVideoParts:
         part2.write_text("fake video content")
         output = tmp_path / "output.mp4"
 
-        with patch("subprocess.run") as mock_run, patch(
-            "media_archive_sync.merge.get_video_duration", return_value=10.0
-        ), patch(
-            "media_archive_sync.merge._resolve_ffprobe_path",
-            return_value="ffprobe",
-        ), patch(
-            "media_archive_sync.merge._create_concat_list"
-        ) as mock_concat:
+        with (
+            patch("subprocess.run") as mock_run,
+            patch("media_archive_sync.merge.get_video_duration", return_value=10.0),
+            patch(
+                "media_archive_sync.merge._resolve_ffprobe_path",
+                return_value="ffprobe",
+            ),
+            patch("media_archive_sync.merge._create_concat_list") as mock_concat,
+        ):
             mock_concat.return_value = tmp_path / "concat.txt"
             mock_run.return_value = MagicMock(returncode=0)
 

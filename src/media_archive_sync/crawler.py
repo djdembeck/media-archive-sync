@@ -39,9 +39,12 @@ def fetch_html(url: str) -> str:
         resp = requests.get(url, timeout=15)
         resp.raise_for_status()
         return resp.text
-    except (requests.RequestException, TimeoutError, ConnectionError, Exception) as exc:
+    except (requests.RequestException, TimeoutError, ConnectionError) as exc:
         logger.debug("Failed to fetch %s: %s", url, exc)
         return ""
+    except Exception as exc:
+        logger.exception("Unexpected error fetching %s: %s", url, exc)
+        raise
 
 
 def crawl_archive(
@@ -104,12 +107,11 @@ def crawl_archive(
 
     while queue:
         dir_url = queue.popleft().rstrip("/") + "/"
+        depth = dir_url.rstrip("/").count("/") - base_url.rstrip("/").count("/")
 
         if progress_callback:
-            depth = dir_url.rstrip("/").count("/") - base_url.rstrip("/").count("/")
             progress_callback(dir_url, depth)
 
-        depth = dir_url.rstrip("/").count("/") - base_url.rstrip("/").count("/")
         if depth > max_depth:
             logger.debug(
                 "Depth %d exceeds max_depth (%d) – skipping %s",
@@ -237,7 +239,7 @@ def save_metadata(dir_url: str, media_meta_file: Path) -> None:
     html_hash = None
     try:
         resp = requests.get(dir_url, timeout=10)
-        if resp is not None and resp.status_code < 400:
+        if resp.status_code < 400:
             h = hashlib.sha256(resp.content).hexdigest()
             html_hash = h
     except Exception:

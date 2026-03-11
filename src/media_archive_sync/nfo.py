@@ -6,6 +6,7 @@ files from media metadata dictionaries.
 
 import contextlib
 import html
+import os
 import re
 from datetime import UTC, datetime
 from pathlib import Path
@@ -248,5 +249,16 @@ def write_nfo_for_path(video_path, nfo_data: str, overwrite: bool = False) -> bo
     with contextlib.suppress(OSError):
         p.parent.mkdir(parents=True, exist_ok=True)
 
-    p.write_text(nfo_data, encoding="utf-8")
+    # Write to temp file and atomically replace to avoid corruption on crash
+    import tempfile
+
+    fd, temp_path = tempfile.mkstemp(dir=p.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(nfo_data)
+        os.replace(temp_path, p)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.unlink(temp_path)
+        raise
     return True
