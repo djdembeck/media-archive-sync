@@ -18,24 +18,28 @@ if [ -z "$VIRTUAL_ENV" ] && [ -z "$CONDA_DEFAULT_ENV" ]; then
 fi
 
 # Get list of staged Python files (null-terminated)
-STAGED_PY_FILES=$(git diff --cached --name-only -z --diff-filter=ACM | grep -z '\.py$' || true)
+# Save to temp file to avoid shell variable issues with null bytes
+STAGED_PY_FILE=$(mktemp)
+git diff --cached --name-only -z --diff-filter=ACM | grep -z '\.py$' > "$STAGED_PY_FILE" || true
 
-if [ -z "$STAGED_PY_FILES" ]; then
+# Check if we have any Python files staged
+if [ ! -s "$STAGED_PY_FILE" ]; then
+    rm -f "$STAGED_PY_FILE"
     echo "${GREEN}No Python files staged for commit.${NC}"
     exit 0
 fi
 
-# Count files for display (strip null bytes for echo)
+# Count files for display
 echo "Staged Python files:"
-printf '%s' "$STAGED_PY_FILES" | tr '\0' '\n'
+cat "$STAGED_PY_FILE" | tr '\0' '\n'
 echo ""
 
 # Run Ruff linter
 echo "Running Ruff linter..."
 if command -v ruff >/dev/null 2>&1; then
-    printf '%s' "$STAGED_PY_FILES" | xargs -0 ruff check --fix
+    cat "$STAGED_PY_FILE" | xargs -0 ruff check --fix
     # Re-stage any files that were auto-fixed
-    printf '%s' "$STAGED_PY_FILES" | xargs -0 git add
+    cat "$STAGED_PY_FILE" | xargs -0 git add
     echo "${GREEN}Ruff checks passed${NC}"
 else
     echo "${YELLOW}ruff not found, skipping...${NC}"
@@ -44,16 +48,19 @@ fi
 # Run Black formatter check
 echo "Running Black formatter..."
 if command -v black >/dev/null 2>&1; then
-    printf '%s' "$STAGED_PY_FILES" | xargs -0 black --check --diff 2>/dev/null || {
+    cat "$STAGED_PY_FILE" | xargs -0 black --check --diff 2>/dev/null || {
         echo "${YELLOW}Running black to fix formatting...${NC}"
-        printf '%s' "$STAGED_PY_FILES" | xargs -0 black
-        printf '%s' "$STAGED_PY_FILES" | xargs -0 git add
+        cat "$STAGED_PY_FILE" | xargs -0 black
+        cat "$STAGED_PY_FILE" | xargs -0 git add
         echo "${GREEN}Formatting fixed and staged${NC}"
     }
     echo "${GREEN}Black checks passed${NC}"
 else
     echo "${YELLOW}black not found, skipping...${NC}"
 fi
+
+# Cleanup temp file
+rm -f "$STAGED_PY_FILE"
 
 # Run quick tests
 echo "Running quick tests..."

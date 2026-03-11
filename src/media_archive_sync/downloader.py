@@ -28,7 +28,7 @@ from .logging import get_logger
 logger = get_logger(__name__)
 
 
-class DownloadCancelled(Exception):
+class DownloadCancelledError(Exception):
     """Raised when a download is cancelled via stop event."""
 
     pass
@@ -139,7 +139,7 @@ def download_file(
                 with open(temp_path, mode) as f:
                     for chunk in response.iter_content(chunk_size=chunk_size):
                         if _stop_event.is_set():
-                            raise DownloadCancelled()
+                            raise DownloadCancelledError()
                         if chunk:
                             f.write(chunk)
                             downloaded += len(chunk)
@@ -317,7 +317,7 @@ def download_files(
                             chunk_size=DEFAULT_CHUNK_SIZE
                         ):
                             if _stop_event.is_set():
-                                raise DownloadCancelled()
+                                raise DownloadCancelledError()
                             if chunk:
                                 f.write(chunk)
 
@@ -343,7 +343,7 @@ def download_files(
                     logger.error(
                         "Download failed after %d retries: %s", max_retries, url
                     )
-            except DownloadCancelled:
+            except DownloadCancelledError:
                 logger.info("Download cancelled: %s", url)
                 return False, False
             finally:

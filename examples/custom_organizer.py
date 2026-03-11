@@ -8,6 +8,7 @@ from media_archive_sync import (
     DownloadManager,
     crawl_archive,
 )
+from media_archive_sync.organizer import organize_files_by_month
 
 config = ArchiveConfig(
     remote_base="https://archive.example.com/vods/",
@@ -24,8 +25,6 @@ media_list, _ = crawl_archive(config=config)
 downloader.download_batch(media_list)
 
 # Organize and create NFOs
-from media_archive_sync.organizer import organize_files_by_month
-
 organize_files_by_month(
     config.local_root,
     config.month_folder_format,
