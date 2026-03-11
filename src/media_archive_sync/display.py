@@ -76,7 +76,8 @@ except ImportError:
 FORCE_PROGRESS = False
 
 # Check if colors should be disabled (NO_COLOR environment variable)
-NO_COLOR = bool(os.getenv("NO_COLOR"))
+# NO_COLOR is considered set if the key exists, even if the value is empty
+NO_COLOR = "NO_COLOR" in os.environ
 
 
 def _stderr_is_tty() -> bool:

@@ -1,4 +1,4 @@
-.PHONY: help install-hooks dev-install test lint format clean
+.PHONY: help install-hooks dev-install test test-cov lint format clean
 
 help:
 	@echo "Available targets:"

@@ -36,8 +36,8 @@ def parse_release_date(candidate) -> str | None:
     # Try timestamp parsing (validate realistic epoch range)
     try:
         val = float(candidate)
-        # Only treat as timestamp if in realistic epoch range (>1e9, <1e12)
-        if 1e9 < val < 1e12:
+        # Only treat as timestamp if in realistic epoch range (>1e9, <2e12)
+        if 1e9 < val < 2e12:
             if val > 1e11:
                 val = val / 1000.0
             dt = datetime.fromtimestamp(val, tz=UTC)
@@ -147,7 +147,7 @@ def build_movie_nfo(
     # Add collections/sets
     if collections:
         c_el = ET.SubElement(movie, "collections")
-        if isinstance(collections, (list, tuple)):
+        if isinstance(collections, (list, tuple, set)):
             for s in collections:
                 if s is None:
                     continue
@@ -216,6 +216,7 @@ def write_nfo_for_path(video_path, nfo_data: str, overwrite: bool = False) -> bo
 
     Writes the provided NFO XML content alongside the media file.
     If the NFO already exists with identical content, skips writing.
+    Directory creation errors are suppressed internally.
 
     Args:
         video_path: Path to the media file (str or Path).
@@ -226,7 +227,7 @@ def write_nfo_for_path(video_path, nfo_data: str, overwrite: bool = False) -> bo
         True if NFO was written or updated, False if skipped (identical content).
 
     Raises:
-        OSError: If file creation or directory creation fails.
+        OSError: If file write fails (directory creation errors are suppressed).
     """
     ppath = Path(video_path)
     p = ppath.with_suffix(".nfo")

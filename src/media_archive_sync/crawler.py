@@ -88,6 +88,9 @@ def crawl_archive(
 
     base_url = (start_dir or remote_base).rstrip("/") + "/"
     remote_base_normalized = (remote_base or base_url).rstrip("/") + "/"
+    base_url_normalized = base_url.rstrip("/") + "/"
+    # Use base_url as prefix when start_dir is provided to limit scope
+    prefix = base_url_normalized if start_dir else remote_base_normalized
 
     # Default video extensions if none provided
     extensions = video_extensions or {".mp4", ".mkv", ".avi", ".mov", ".webm"}
@@ -131,10 +134,7 @@ def crawl_archive(
             if href.endswith("/"):
                 sub_url = urllib.parse.urljoin(dir_url, href)
                 normalized_url = sub_url.rstrip("/") + "/"
-                if (
-                    normalized_url.startswith(remote_base_normalized)
-                    and normalized_url not in visited
-                ):
+                if normalized_url.startswith(prefix) and normalized_url not in visited:
                     visited.add(normalized_url)
                     queue.append(sub_url)
 
@@ -158,21 +158,27 @@ def crawl_archive(
     return media_list, dir_counts
 
 
-def fetch_directory(dir_url: str) -> list[tuple[str, str]]:
+def fetch_directory(
+    dir_url: str, allowed_extensions: set[str] | None = None
+) -> list[tuple[str, str]]:
     """Fetch a single remote directory listing.
 
-    Returns a list of (full_url, decoded_basename) tuples.
+    Returns a list of (full_url, decoded_basename) tuples for media files only.
 
     This is a lightweight alternative to crawling the whole archive when
     we only need to check one directory for new files.
 
     Args:
         dir_url: The URL of the directory to fetch.
+        allowed_extensions: Set of allowed file extensions (e.g., {'.mp4', '.mkv'}).
+            If None, defaults to common video extensions.
 
     Returns:
-        List of (full_url, decoded_basename) tuples.
+        List of (full_url, decoded_basename) tuples for media files.
     """
     out: list[tuple[str, str]] = []
+    extensions = allowed_extensions or {".mp4", ".mkv", ".avi", ".mov", ".webm"}
+    ext_pattern = "|".join(re.escape(ext.lstrip(".")) for ext in extensions)
     try:
         html = fetch_html(dir_url)
         if not html:
@@ -183,6 +189,11 @@ def fetch_directory(dir_url: str) -> list[tuple[str, str]]:
             if href in ("../", "./"):
                 continue
             if href.endswith("/"):
+                continue
+            # Filter to only include media files with allowed extensions
+            # Parse the path to ignore query strings when checking extensions
+            href_path = urllib.parse.urlparse(href).path
+            if not re.search(rf"\.({ext_pattern})$", href_path, re.I):
                 continue
             full = urllib.parse.urljoin(dir_url, href)
             dec = urldecode(Path(urllib.parse.urlparse(full).path).name)
@@ -207,6 +218,10 @@ def save_metadata(dir_url: str, media_meta_file: Path) -> None:
         if media_meta_file.is_file():
             with media_meta_file.open("r", encoding="utf-8") as mf:
                 meta = json.load(mf)
+        # Validate that loaded meta is a dict; reset if not
+        if not isinstance(meta, dict):
+            logger.debug("Media meta cache was not a dict, resetting")
+            meta = {}
     except (json.JSONDecodeError, TypeError, OSError) as e:
         logger.debug("Failed to load existing media meta: %s", e)
         meta = {}

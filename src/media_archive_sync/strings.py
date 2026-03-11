@@ -88,18 +88,17 @@ def _strip_bang_tokens(title: str, tokens: set[str] | None = None) -> str:
     parts = []
     toks = str(title).split()
     for i, p in enumerate(toks):
-        ps = p.lstrip()
         # Strip explicit advertising tags like '#ad' (case-insensitive)
-        if ps.lower() == "#ad":
+        if p.lower() == "#ad":
             continue
 
         # If a '!tag' is attached to the end of a token without a space
         # (e.g., 'D!gg' or 'word!tts'), try to strip the '!tag' part when
         # it looks like an operator/tag we normally remove.
-        if "!" in ps and not ps.startswith("!"):
-            idx = ps.rfind("!")
-            prefix = ps[:idx]
-            suffix = ps[idx + 1 :]
+        if "!" in p and not p.startswith("!"):
+            idx = p.rfind("!")
+            prefix = p[:idx]
+            suffix = p[idx + 1 :]
             is_known = suffix.lower() in bang_tokens or suffix.islower()
             if suffix and is_known:
                 if prefix:
@@ -107,8 +106,8 @@ def _strip_bang_tokens(title: str, tokens: set[str] | None = None) -> str:
                 continue
 
         # Handle operator tokens that begin with '!'
-        if ps.startswith("!"):
-            tag = ps[1:]
+        if p.startswith("!"):
+            tag = p[1:]
             if tag.lower() in bang_tokens:
                 continue
             if tag.islower():

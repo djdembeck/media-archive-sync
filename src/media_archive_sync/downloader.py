@@ -160,6 +160,9 @@ def download_file(
             result = _do_download(session)
             return result
 
+    except DownloadCancelledError:
+        logger.debug("Download cancelled for %s", url)
+        return False, 0
     except requests.exceptions.RequestException as exc:
         logger.warning("Download failed for %s: %s", url, exc)
         return False, 0
@@ -520,6 +523,7 @@ class DownloadManager:
         Returns:
             Tuple of (success_count, skip_count, fail_count, downloaded_paths).
         """
+        disable_progress = None if not self.config.quiet else True
         return download_files(
             media_list=media_list,
             workers=self.config.workers,
@@ -528,7 +532,7 @@ class DownloadManager:
             timeout=self.config.request_timeout,
             max_retries=self.config.max_retries,
             progress_desc=progress_desc,
-            disable_progress=self.config.quiet,
+            disable_progress=disable_progress,
             stop_event=self._stop_event,
             active_sessions=self._active_sessions,
             sessions_lock=self._sessions_lock,
@@ -537,8 +541,15 @@ class DownloadManager:
         )
 
     def stop(self) -> None:
-        """Signal all downloads to stop."""
+        """Signal all downloads to stop and interrupt active sessions."""
         self._stop_event.set()
+        # Interrupt active requests to unblock threads waiting on network I/O
+        with self._sessions_lock:
+            for session in list(self._active_sessions):
+                with contextlib.suppress(Exception):
+                    session.close()
+        # Clean up partial files to match SIGINT handler behavior
+        self.cleanup_partials()
 
     def cleanup_partials(self) -> None:
         """Clean up any remaining partial download files."""
