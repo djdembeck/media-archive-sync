@@ -13,6 +13,7 @@ build/
 # Testing
 htmlcov/
 .coverage
+coverage.xml
 .pytest_cache/
 .mypy_cache/
 
@@ -40,4 +41,4 @@ log.txt
 
 # Oh-My-OpenCode
 oh-my-opencode.json
-.sisyphus/
+.sisyphus/coverage.xml

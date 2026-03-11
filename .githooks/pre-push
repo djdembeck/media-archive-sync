@@ -1,0 +1,51 @@
+#!/bin/sh
+# Native git pre-push hook for media-archive-sync
+# Runs full test suite with coverage before allowing push
+
+set -e
+
+echo "Running pre-push checks..."
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Check if we're in a virtual environment
+if [ -z "$VIRTUAL_ENV" ] && [ -z "$CONDA_DEFAULT_ENV" ]; then
+    echo "${YELLOW}Warning: Not in a virtual environment${NC}"
+fi
+
+# Run full test suite with coverage
+echo "Running full test suite with coverage..."
+if command -v pytest >/dev/null 2>&1; then
+    pytest \
+        --cov=src/media_archive_sync \
+        --cov-report=term-missing \
+        --cov-fail-under=80 \
+        --tb=short \
+        -q \
+        --disable-warnings 2>/dev/null || {
+        echo "${RED}Tests or coverage check failed!${NC}"
+        echo "${YELLOW}Coverage must be >= 80%${NC}"
+        exit 1
+    }
+    echo "${GREEN}All tests passed with adequate coverage!${NC}"
+else
+    echo "${YELLOW}pytest not found, skipping...${NC}"
+fi
+
+# Run MyPy type checking
+echo "Running MyPy type checking..."
+if command -v mypy >/dev/null 2>&1; then
+    mypy src/media_archive_sync --ignore-missing-imports || {
+        echo "${YELLOW}MyPy found type issues (warnings only, not blocking)${NC}"
+    }
+    echo "${GREEN}MyPy checks completed${NC}"
+else
+    echo "${YELLOW}mypy not found, skipping...${NC}"
+fi
+
+echo "${GREEN}All pre-push checks passed!${NC}"
+exit 0
