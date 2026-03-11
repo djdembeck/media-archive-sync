@@ -175,8 +175,13 @@ def build_movie_nfo(
 
     if actors:
         seen_actors = set()
-        actor_list = [actors] if isinstance(actors, str) else actors
-        if not isinstance(actor_list, (list, tuple, set)):
+        if isinstance(actors, str):
+            actor_list = [actors]
+        elif isinstance(actors, set):
+            actor_list = sorted(actors)
+        else:
+            actor_list = actors
+        if not isinstance(actor_list, (list, tuple)):
             actor_list = [actor_list]
         for actor_name in actor_list:
             if not actor_name:
@@ -194,8 +199,13 @@ def build_movie_nfo(
 
     if genres:
         seen_genres = set()
-        genre_list = [genres] if isinstance(genres, str) else genres
-        if not isinstance(genre_list, (list, tuple, set)):
+        if isinstance(genres, str):
+            genre_list = [genres]
+        elif isinstance(genres, set):
+            genre_list = sorted(genres)
+        else:
+            genre_list = genres
+        if not isinstance(genre_list, (list, tuple)):
             genre_list = [genre_list]
         for genre_name in genre_list:
             if not genre_name:
@@ -260,14 +270,18 @@ def write_nfo_for_path(video_path, nfo_data: str, overwrite: bool = False) -> bo
         p.parent.mkdir(parents=True, exist_ok=True)
 
     # Write to temp file and atomically replace to avoid corruption on crash
-    fd, temp_path = tempfile.mkstemp(dir=p.parent, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(nfo_data)
-        os.replace(temp_path, p)
-    except Exception:
-        os.close(fd)
-        with contextlib.suppress(OSError):
-            os.unlink(temp_path)
-        raise
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", delete=False, dir=p.parent, suffix=".tmp"
+    ) as tf:
+        temp_path = tf.name
+        try:
+            tf.write(nfo_data)
+            tf.flush()
+            tf.close()
+            os.replace(temp_path, p)
+        except Exception:
+            tf.close()
+            with contextlib.suppress(OSError):
+                os.unlink(temp_path)
+            raise
     return True

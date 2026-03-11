@@ -245,8 +245,9 @@ def save_metadata(dir_url: str, media_meta_file: Path) -> None:
         logger.debug("Failed to load existing media meta: %s", e)
         meta = {}
 
+    headers = {"User-Agent": "media-archive-sync/1.0"}
     try:
-        head = requests.head(dir_url, timeout=8, allow_redirects=True)
+        head = requests.head(dir_url, timeout=8, allow_redirects=True, headers=headers)
     except requests.RequestException:
         head = None
 
@@ -255,7 +256,7 @@ def save_metadata(dir_url: str, media_meta_file: Path) -> None:
 
     html_hash = None
     try:
-        resp = requests.get(dir_url, timeout=10)
+        resp = requests.get(dir_url, timeout=10, headers=headers)
         if resp.status_code < 400:
             h = hashlib.sha256(resp.content).hexdigest()
             html_hash = h
