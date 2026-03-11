@@ -60,11 +60,16 @@ def parse_release_date(candidate) -> str | None:
         s2 = str(candidate).strip()
         if len(s2) >= 10:
             candidate_date = s2[:10]
-            # Validate YYYY-MM-DD format
+            # Validate YYYY-MM-DD format and ensure it's a real calendar date
             if re.match(
                 r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$", candidate_date
             ):
-                return candidate_date
+                try:
+                    datetime.strptime(candidate_date, "%Y-%m-%d")
+                    return candidate_date
+                except ValueError:
+                    # Not a valid calendar date (e.g., 2023-02-30)
+                    pass
     except (ValueError, TypeError):
         pass
 

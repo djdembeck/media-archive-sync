@@ -98,16 +98,18 @@ class Cache:
     def _init_sqlite(self) -> None:
         """Initialize the SQLite database with WAL mode."""
         conn = sqlite3.connect(str(self.db_path), timeout=30)
-        with contextlib.suppress(sqlite3.Error):
-            conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS kv (
-                k TEXT PRIMARY KEY,
-                v TEXT
-            )
-            """)
-        conn.commit()
-        conn.close()
+        try:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS kv (
+                    k TEXT PRIMARY KEY,
+                    v TEXT
+                )
+                """)
+            conn.commit()
+        finally:
+            conn.close()
 
     def get(self, key: str) -> Any | None:
         """Retrieve a value from the cache.

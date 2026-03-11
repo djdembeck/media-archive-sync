@@ -39,7 +39,7 @@ fi
 # Run MyPy type checking
 echo "Running MyPy type checking..."
 if command -v mypy >/dev/null 2>&1; then
-    mypy src/media_archive_sync --ignore-missing-imports --tb=short 2>/dev/null || {
+    mypy src/media_archive_sync --ignore-missing-imports || {
         echo "${YELLOW}MyPy found type issues (warnings only, not blocking)${NC}"
     }
     echo "${GREEN}MyPy checks completed${NC}"

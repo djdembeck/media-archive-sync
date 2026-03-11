@@ -10,6 +10,7 @@ This module provides generic file download functionality with support for:
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import signal
 import threading
 import time
@@ -25,6 +26,13 @@ from .display import rich_progress_or_stderr
 from .logging import get_logger
 
 logger = get_logger(__name__)
+
+
+class DownloadCancelled(Exception):
+    """Raised when a download is cancelled via stop event."""
+
+    pass
+
 
 # Default configuration values
 DEFAULT_TIMEOUT = 15
@@ -131,7 +139,7 @@ def download_file(
                 with open(temp_path, mode) as f:
                     for chunk in response.iter_content(chunk_size=chunk_size):
                         if _stop_event.is_set():
-                            raise KeyboardInterrupt()
+                            raise DownloadCancelled()
                         if chunk:
                             f.write(chunk)
                             downloaded += len(chunk)
@@ -172,7 +180,7 @@ def download_files(
     max_retries: int = DEFAULT_MAX_RETRIES,
     retry_backoff: float = DEFAULT_RETRY_BACKOFF,
     progress_desc: str = "Downloading",
-    disable_progress: bool = False,
+    disable_progress: bool | None = None,
     stop_event: threading.Event | None = None,
     active_sessions: set | None = None,
     sessions_lock: threading.Lock | None = None,
@@ -190,7 +198,7 @@ def download_files(
         max_retries: Maximum number of retry attempts per file.
         retry_backoff: Base seconds between retries (multiplied by attempt).
         progress_desc: Description for the progress bar.
-        disable_progress: If True, disable progress bar display.
+        disable_progress: If True, disable progress bar display. If None, auto-detect.
         stop_event: Optional threading.Event for cancellation.
         active_sessions: Optional set to track active sessions.
         sessions_lock: Optional lock for active_sessions.
@@ -309,7 +317,7 @@ def download_files(
                             chunk_size=DEFAULT_CHUNK_SIZE
                         ):
                             if _stop_event.is_set():
-                                raise KeyboardInterrupt()
+                                raise DownloadCancelled()
                             if chunk:
                                 f.write(chunk)
 
@@ -335,8 +343,8 @@ def download_files(
                     logger.error(
                         "Download failed after %d retries: %s", max_retries, url
                     )
-            except KeyboardInterrupt:
-                logger.info("Download interrupted: %s", url)
+            except DownloadCancelled:
+                logger.info("Download cancelled: %s", url)
                 return False, False
             finally:
                 if session is not None:
@@ -358,18 +366,14 @@ def download_files(
 
             with _sessions_lock:
                 for s in list(_active_sessions):
-                    try:
+                    with contextlib.suppress(Exception):
                         s.close()
-                    except Exception:
-                        pass
 
             with _partials_lock:
                 for p in list(_partials):
-                    try:
+                    with contextlib.suppress(Exception):
                         if p.exists():
                             p.unlink()
-                    except Exception:
-                        pass
 
             raise KeyboardInterrupt()
 
@@ -540,11 +544,9 @@ class DownloadManager:
         """Clean up any remaining partial download files."""
         with self._partials_lock:
             for p in list(self._partials):
-                try:
+                with contextlib.suppress(Exception):
                     if p.exists():
                         p.unlink()
-                except Exception:
-                    pass
 
     def __enter__(self) -> DownloadManager:
         """Context manager entry."""

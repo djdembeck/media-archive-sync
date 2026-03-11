@@ -284,9 +284,9 @@ def filter_cached_index_for_period(
     Returns:
         Tuple of (filtered_media_list, filtered_dir_counts, prepared_flag).
         prepared_flag is True if filtering was applied successfully.
-
-    Raises:
-        ValueError: If periodic_dir is not found in dir_counts.
+        When periodic_dir is not found in dir_counts, returns the original
+        media_list, dir_counts, and False (prepared_flag=False), rather than
+        raising an exception.
     """
     if not periodic_dir:
         return media_list or [], dict(dir_counts or {}), False

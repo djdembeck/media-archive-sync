@@ -45,8 +45,8 @@ class _DummyTqdm:
         self.desc = desc
 
     @staticmethod
-    def write(msg):
-        print(msg, file=sys.stderr)
+    def write(msg, file=sys.stderr, end="\n"):
+        print(msg, file=file, end=end)
 
 
 try:
@@ -180,7 +180,7 @@ class _TqdmProgressWrapper:
 
     def write(self, s: str) -> None:
         """Write a message above the progress bar."""
-        tqdm.write(s)
+        tqdm.write(s, file=sys.stderr)
 
 
 if RICH_AVAILABLE:
