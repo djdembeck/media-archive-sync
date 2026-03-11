@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import sqlite3
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -197,6 +198,12 @@ class Cache:
             value: The value to cache.
         """
         try:
+            txt = json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError) as exc:
+            logger.warning("JSON serialization failed for key '%s': %s", key, exc)
+            return
+
+        try:
             conn = sqlite3.connect(str(self.db_path), timeout=30)
             try:
                 conn.execute("PRAGMA journal_mode=WAL")
@@ -204,7 +211,6 @@ class Cache:
                 pass
             try:
                 cur = conn.cursor()
-                txt = json.dumps(value, ensure_ascii=False)
                 cur.execute(
                     "INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)",
                     (key, txt),
@@ -220,12 +226,28 @@ class Cache:
         try:
             path = self._get_json_path(key)
             wrapped = {"_cache_envelope": {"key": key, "value": value}}
-            temp_path = path.with_suffix(path.suffix + ".tmp")
-            with temp_path.open("w", encoding="utf-8") as f:
-                json.dump(wrapped, f, indent=2, ensure_ascii=False)
-                f.flush()
-                os.fsync(f.fileno())
-            temp_path.replace(path)
+            # Use unique temp file to avoid clashes between concurrent writers
+            temp_fd = None
+            temp_path = None
+            try:
+                temp_fd, temp_name = tempfile.mkstemp(
+                    suffix=".tmp", prefix=path.stem + "_", dir=path.parent
+                )
+                temp_path = Path(temp_name)
+                with os.fdopen(temp_fd, "w", encoding="utf-8") as f:
+                    json.dump(wrapped, f, indent=2, ensure_ascii=False)
+                    f.flush()
+                    os.fsync(f.fileno())
+                temp_path.replace(path)
+            except Exception:
+                if temp_path is not None and temp_path.exists():
+                    temp_path.unlink(missing_ok=True)
+                if temp_fd is not None:
+                    try:
+                        os.close(temp_fd)
+                    except OSError:
+                        pass
+                raise
         except (OSError, TypeError, ValueError) as exc:
             logger.warning("JSON set failed for key '%s': %s", key, exc)
 

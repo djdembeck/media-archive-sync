@@ -212,8 +212,8 @@ if RICH_AVAILABLE:
                     BarColumn(),
                     TextColumn("[{task.completed}/{task.total}]"),
                     TimeRemainingColumn(),
-                    console=Console(stderr=True),
-                    disable=self.disable or NO_COLOR,
+                    console=Console(stderr=True, no_color=NO_COLOR),
+                    disable=self.disable,
                 )
                 self._progress.start()
                 self._task_id = self._progress.add_task(self.desc, total=self.total)
