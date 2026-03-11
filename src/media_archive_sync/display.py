@@ -12,12 +12,46 @@ import sys
 from contextlib import contextmanager
 from typing import Any, Iterable, Optional, TextIO, Union
 
-# tqdm is optional - provides fallback progress bars
+class _DummyTqdm:
+    def __init__(self, iterable=None, *, desc=None, total=None, **kwargs):
+        self.iterable = iterable
+        self.desc = desc
+        self.total = total
+        self.n = 0
+
+    def __iter__(self):
+        if self.iterable is not None:
+            for item in self.iterable:
+                yield item
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+    def update(self, n=1):
+        self.n += n
+
+    def close(self):
+        pass
+
+    def refresh(self):
+        pass
+
+    def set_description_str(self, desc):
+        self.desc = desc
+
+    @staticmethod
+    def write(msg):
+        print(msg, file=sys.stderr)
+
+
 try:
     from tqdm import tqdm
 except ImportError:
-    def tqdm(x, **kwargs):  # type: ignore
-        return x
+    tqdm = _DummyTqdm
 
 
 # Rich is optional - provides beautiful progress bars

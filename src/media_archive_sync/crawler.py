@@ -86,6 +86,7 @@ def crawl_archive(
         raise ValueError("Either remote_base or start_dir must be provided")
 
     base_url = (start_dir or remote_base).rstrip("/") + "/"
+    remote_base_normalized = (remote_base or base_url).rstrip("/") + "/"
 
     # Default video extensions if none provided
     extensions = video_extensions or {".mp4", ".mkv", ".avi", ".mov", ".webm"}
@@ -94,8 +95,8 @@ def crawl_archive(
     media_list: List[Tuple[str, str]] = []
     dir_counts: Dict[str, int] = {}
 
-    queue = deque([base_url])
-    visited: set[str] = set()
+    queue: deque[str] = deque([base_url])
+    visited: set[str] = {base_url}
 
     while queue:
         dir_url = queue.popleft().rstrip("/") + "/"
@@ -129,7 +130,7 @@ def crawl_archive(
             if href.endswith("/"):
                 sub_url = urllib.parse.urljoin(dir_url, href)
                 normalized_url = sub_url.rstrip("/") + "/"
-                if normalized_url not in visited:
+                if normalized_url.startswith(remote_base_normalized) and normalized_url not in visited:
                     visited.add(normalized_url)
                     queue.append(sub_url)
 
@@ -279,9 +280,10 @@ def filter_cached_index_for_period(
         return media_list or [], dict(dir_counts or {}), False
     media_list = media_list or []
     dir_counts = dict(dir_counts or {})
-    if periodic_dir in dir_counts and dir_counts.get(periodic_dir, 0) > 0:
-        filtered = [it for it in media_list if it[0].startswith(periodic_dir)]
-        return filtered, {periodic_dir: len(filtered)}, True
+    normalized_periodic = periodic_dir.rstrip("/") + "/"
+    if normalized_periodic in dir_counts:
+        filtered = [it for it in media_list if it[0].startswith(normalized_periodic)]
+        return filtered, {normalized_periodic: len(filtered)}, True
     return media_list, dir_counts, False
 
 
@@ -306,11 +308,11 @@ def find_missing_to_append(
         List of (url, decoded_name) tuples that are in month_items
         but not in cached_media.
     """
-    existing = {n for _, n in (cached_media or [])}
+    existing = set(cached_media or [])
     to_append: List[Tuple[str, str]] = []
-    for full, dec in month_items or []:
-        if dec not in existing:
-            to_append.append((full, dec))
+    for item in month_items or []:
+        if item not in existing:
+            to_append.append(item)
     return to_append
 
 

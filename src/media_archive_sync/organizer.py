@@ -18,7 +18,8 @@ Usage notes:
 import json
 import os
 import re
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
@@ -80,10 +81,9 @@ def extract_date_from_epoch(epoch: int) -> Optional[datetime]:
         A datetime object in UTC, or None if conversion fails.
     """
     try:
-        # Detect milliseconds (13 digits) vs seconds (10 digits)
         if epoch > 1_000_000_000_000:
             epoch = epoch // 1000
-        return datetime.fromtimestamp(epoch)
+        return datetime.fromtimestamp(epoch, tz=timezone.utc)
     except (ValueError, OSError, OverflowError) as e:
         logger.debug("extract_date_from_epoch: failed to convert %d: %s", epoch, e)
         return None
@@ -168,6 +168,7 @@ def load_local_index(
     local_root: Path,
     video_extensions: Optional[Set[str]] = None,
     use_cache: bool = True,
+    max_cache_age: Optional[int] = 3600,
 ) -> Dict[str, Path]:
     """Load or build a cached index of local files.
 
@@ -179,24 +180,28 @@ def load_local_index(
         local_root: Base local directory to scan.
         video_extensions: Optional set of extensions to filter by.
         use_cache: Whether to use/load from cache.
+        max_cache_age: Maximum cache age in seconds (default: 1 hour).
 
     Returns:
         Dictionary mapping filenames to their Path objects.
     """
     if use_cache and cache_file.exists():
         try:
-            with cache_file.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-            mapping = {k: Path(v) for k, v in data.items()}
-            logger.debug("Loaded local file index: %d entries", len(mapping))
-            return mapping
+            cache_stat = cache_file.stat()
+            cache_age = time.time() - cache_stat.st_mtime
+            if max_cache_age is not None and cache_age > max_cache_age:
+                logger.debug("Cache is stale (age=%.0fs, max=%ds)", cache_age, max_cache_age)
+            else:
+                with cache_file.open("r", encoding="utf-8") as f:
+                    data = json.load(f)
+                mapping = {k: Path(v) for k, v in data.items()}
+                logger.debug("Loaded local file index: %d entries", len(mapping))
+                return mapping
         except (OSError, PermissionError, json.JSONDecodeError) as e:
             logger.debug("Failed to load local index cache: %s", e)
 
-    # Build fresh index
     mapping = load_local_files(local_root, video_extensions)
 
-    # Persist to cache
     try:
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         with cache_file.open("w", encoding="utf-8") as f:

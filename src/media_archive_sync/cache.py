@@ -6,6 +6,7 @@ JSON files or SQLite as the storage backend.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sqlite3
@@ -58,7 +59,10 @@ class Cache:
             self._init_sqlite()
 
     def _get_json_path(self, key: str) -> Path:
-        """Get the file path for a JSON cache entry.
+        """Get the file path for a JSON cache entry using hash-based filename.
+
+        Uses SHA256 hash of the full key to ensure collision-safe filenames
+        while storing the original key inside the JSON payload.
 
         Args:
             key: The cache key.
@@ -66,11 +70,33 @@ class Cache:
         Returns:
             Path to the JSON cache file.
         """
-        # Sanitize key for filesystem safety
-        safe_key = "".join(c for c in key if c.isalnum() or c in "_-").rstrip()
-        if not safe_key:
-            safe_key = "_"
-        return self.cache_dir / f"{safe_key}.json"
+        # Use SHA256 hash for collision-safe filename
+        key_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+        # Create a sanitized prefix for readability (first 32 chars)
+        safe_prefix = "".join(c for c in key[:32] if c.isalnum() or c in "_-").rstrip()
+        if not safe_prefix:
+            safe_prefix = "_"
+        return self.cache_dir / f"{safe_prefix}_{key_hash}.json"
+
+    def _get_key_from_json(self, path: Path) -> str | None:
+        """Extract the original key from a JSON cache file.
+
+        Args:
+            path: Path to the JSON cache file.
+
+        Returns:
+            The original cache key, or None if not found.
+        """
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            # Check if this is the new format with metadata
+            if isinstance(data, dict) and "_cache_key" in data:
+                return data["_cache_key"]
+            # Legacy format: return stem as key (may be truncated)
+            return path.stem
+        except (OSError, json.JSONDecodeError):
+            return None
 
     def _init_sqlite(self) -> None:
         """Initialize the SQLite database with WAL mode."""
@@ -150,7 +176,12 @@ class Cache:
             if not path.is_file():
                 return None
             with path.open("r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+            if isinstance(data, dict):
+                if "_cache_value" in data:
+                    return data["_cache_value"]
+                return {k: v for k, v in data.items() if k != "_cache_key"}
+            return data
         except (OSError, json.JSONDecodeError) as exc:
             logger.debug("JSON get failed for key '%s': %s", key, exc)
             return None
@@ -202,8 +233,12 @@ class Cache:
         """
         try:
             path = self._get_json_path(key)
+            if isinstance(value, dict):
+                wrapped = {**value, "_cache_key": key}
+            else:
+                wrapped = {"_cache_value": value, "_cache_key": key}
             with path.open("w", encoding="utf-8") as f:
-                json.dump(value, f, indent=2, ensure_ascii=False)
+                json.dump(wrapped, f, indent=2, ensure_ascii=False)
         except (OSError, TypeError, ValueError) as exc:
             logger.warning("JSON set failed for key '%s': %s", key, exc)
 
@@ -339,7 +374,9 @@ class Cache:
         try:
             keys = []
             for path in self.cache_dir.glob("*.json"):
-                keys.append(path.stem)
+                key = self._get_key_from_json(path)
+                if key:
+                    keys.append(key)
             return keys
         except OSError as exc:
             logger.debug("JSON keys query failed: %s", exc)

@@ -47,7 +47,7 @@ def get_video_duration(video_path: Path, ffprobe_path: str = "ffprobe") -> Optio
         )
         out = result.stdout.strip()
         return float(out) if out else None
-    except (subprocess.CalledProcessError, ValueError) as exc:
+    except (subprocess.CalledProcessError, ValueError, FileNotFoundError, OSError) as exc:
         logger.debug("Failed to get duration for %s: %s", video_path, exc)
         return None
 
@@ -179,7 +179,7 @@ def merge_video_parts(
         logger.info("Successfully merged to: %s", output_path)
         return True
 
-    except subprocess.CalledProcessError as exc:
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError) as exc:
         logger.error("ffmpeg merge failed: %s", exc)
         return False
     finally:

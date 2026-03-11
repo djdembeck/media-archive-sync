@@ -152,13 +152,17 @@ def build_movie_nfo(
                 set_el = ET.SubElement(c_el, "set")
                 set_el.text = ss
 
-    # Add actors
     if actors:
         seen_actors = set()
-        for actor_name in actors:
+        actor_list = [actors] if isinstance(actors, str) else actors
+        if not isinstance(actor_list, (list, tuple, set)):
+            actor_list = [actor_list]
+        for actor_name in actor_list:
             if not actor_name:
                 continue
             name = str(actor_name).strip()
+            if not name:
+                continue
             key = name.lower()
             if key in seen_actors:
                 continue
@@ -170,13 +174,17 @@ def build_movie_nfo(
             except Exception:
                 pass
 
-    # Add genres
     if genres:
         seen_genres = set()
-        for genre_name in genres:
+        genre_list = [genres] if isinstance(genres, str) else genres
+        if not isinstance(genre_list, (list, tuple, set)):
+            genre_list = [genre_list]
+        for genre_name in genre_list:
             if not genre_name:
                 continue
             name = str(genre_name).strip()
+            if not name:
+                continue
             try:
                 name = html.unescape(name)
             except Exception:

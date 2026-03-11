@@ -76,14 +76,21 @@ def download_file(
 
         with session.get(url, stream=True, timeout=timeout, headers=headers) as response:
             if response.status_code == 416:
-                # Range unsatisfiable - file already complete or invalid range
+                try:
+                    head = session.head(url, timeout=timeout, allow_redirects=True)
+                    expected_size = int(head.headers.get("Content-Length", "-1"))
+                    actual_size = temp_path.stat().st_size
+                    if expected_size > 0 and actual_size >= expected_size:
+                        temp_path.replace(local_path)
+                        return True, actual_size
+                except Exception:
+                    pass
                 temp_path.unlink(missing_ok=True)
-                return True, start_byte
+                return download_file(url, local_path, timeout, False, chunk_size, progress_callback)
 
             response.raise_for_status()
 
-            # Determine write mode and total size
-            mode = "ab" if headers.get("Range") else "wb"
+            mode = "ab" if response.status_code == 206 else "wb"
             total_size = -1
             try:
                 total_size = int(response.headers.get("Content-Length", "-1"))
@@ -129,6 +136,11 @@ def download_files(
     retry_backoff: float = DEFAULT_RETRY_BACKOFF,
     progress_desc: str = "Downloading",
     disable_progress: bool = False,
+    stop_event: Optional[threading.Event] = None,
+    active_sessions: Optional[set] = None,
+    sessions_lock: Optional[threading.Lock] = None,
+    partials: Optional[set[Path]] = None,
+    partials_lock: Optional[threading.Lock] = None,
 ) -> Tuple[int, int, int, List[Path]]:
     """Download multiple files using a thread pool.
 
@@ -142,6 +154,11 @@ def download_files(
         retry_backoff: Base seconds between retries (multiplied by attempt).
         progress_desc: Description for the progress bar.
         disable_progress: If True, disable progress bar display.
+        stop_event: Optional threading.Event for cancellation.
+        active_sessions: Optional set to track active sessions.
+        sessions_lock: Optional lock for active_sessions.
+        partials: Optional set to track partial files.
+        partials_lock: Optional lock for partials.
 
     Returns:
         Tuple of (success_count, skip_count, fail_count, downloaded_paths).
@@ -152,25 +169,23 @@ def download_files(
     total = len(media_list)
     workers = max(1, min(workers, total))
 
-    # Track results
     success_count = 0
     skip_count = 0
     fail_count = 0
     downloaded_paths: List[Path] = []
 
-    # Threading control
-    stop_event = threading.Event()
-    active_sessions: set = set()
-    sessions_lock = threading.Lock()
-    partials: set[Path] = set()
-    partials_lock = threading.Lock()
+    _stop_event = stop_event or threading.Event()
+    _active_sessions = active_sessions if active_sessions is not None else set()
+    _sessions_lock = sessions_lock or threading.Lock()
+    _partials = partials if partials is not None else set()
+    _partials_lock = partials_lock or threading.Lock()
 
     def worker(item: Tuple[str, Path]) -> Tuple[bool, bool]:
         """Download a single file. Returns (success, skipped)."""
         url, local_path = item
         session = None
 
-        if stop_event.is_set():
+        if _stop_event.is_set():
             return False, False
 
         # Check if file exists
@@ -194,7 +209,7 @@ def download_files(
         # Attempt download with retries
         attempt = 0
         while attempt < max_retries:
-            if stop_event.is_set():
+            if _stop_event.is_set():
                 return False, False
 
             attempt += 1
@@ -203,8 +218,8 @@ def download_files(
             try:
                 session = requests.Session()
                 session.mount("https://", HTTPAdapter(max_retries=1))
-                with sessions_lock:
-                    active_sessions.add(session)
+                with _sessions_lock:
+                    _active_sessions.add(session)
 
                 # Check for resume capability
                 headers: Dict[str, str] = {}
@@ -226,24 +241,21 @@ def download_files(
 
                     mode = "ab" if headers.get("Range") else "wb"
 
-                    # Track partial file
-                    with partials_lock:
-                        partials.add(temp_path)
+                    with _partials_lock:
+                        _partials.add(temp_path)
 
                     with open(temp_path, mode) as f:
                         for chunk in response.iter_content(chunk_size=DEFAULT_CHUNK_SIZE):
-                            if stop_event.is_set():
+                            if _stop_event.is_set():
                                 raise KeyboardInterrupt()
                             if chunk:
                                 f.write(chunk)
 
-                # Move to final location
                 local_path.parent.mkdir(parents=True, exist_ok=True)
                 temp_path.replace(local_path)
 
-                # Cleanup tracking
-                with partials_lock:
-                    partials.discard(temp_path)
+                with _partials_lock:
+                    _partials.discard(temp_path)
 
                 logger.info("Downloaded: %s", local_path.name)
                 return True, False
@@ -265,41 +277,40 @@ def download_files(
                 return False, False
             finally:
                 if session is not None:
-                    with sessions_lock:
-                        active_sessions.discard(session)
+                    with _sessions_lock:
+                        _active_sessions.discard(session)
                     session.close()
 
         return False, False
 
-    # Set up SIGINT handler for graceful shutdown
-    old_handler = signal.getsignal(signal.SIGINT)
+    old_handler = None
+    _sigint_handler = None
 
-    def _sigint_handler(sig: int, frame: Any) -> None:
-        """Handle Ctrl+C by stopping downloads and cleaning up partials."""
-        logger.info("Download cancelled by user. Cleaning up...")
-        stop_event.set()
+    if threading.current_thread() is threading.main_thread():
+        old_handler = signal.getsignal(signal.SIGINT)
 
-        # Close active sessions
-        with sessions_lock:
-            for s in list(active_sessions):
-                try:
-                    s.close()
-                except Exception:
-                    pass
+        def _sigint_handler(sig: int, frame: Any) -> None:
+            logger.info("Download cancelled by user. Cleaning up...")
+            _stop_event.set()
 
-        # Remove partial files
-        with partials_lock:
-            for p in list(partials):
-                try:
-                    if p.exists():
-                        p.unlink()
-                except Exception:
-                    pass
+            with _sessions_lock:
+                for s in list(_active_sessions):
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
 
-        # Raise KeyboardInterrupt to allow proper cleanup
-        raise KeyboardInterrupt()
+            with _partials_lock:
+                for p in list(_partials):
+                    try:
+                        if p.exists():
+                            p.unlink()
+                    except Exception:
+                        pass
 
-    signal.signal(signal.SIGINT, _sigint_handler)
+            raise KeyboardInterrupt()
+
+        signal.signal(signal.SIGINT, _sigint_handler)
 
     try:
         with rich_progress_or_stderr(
@@ -333,7 +344,8 @@ def download_files(
                         fail_count += 1
 
     finally:
-        signal.signal(signal.SIGINT, old_handler)
+        if old_handler is not None and threading.current_thread() is threading.main_thread():
+            signal.signal(signal.SIGINT, old_handler)
 
     return success_count, skip_count, fail_count, downloaded_paths
 
@@ -423,6 +435,11 @@ class DownloadManager:
             max_retries=self.config.max_retries,
             progress_desc=progress_desc,
             disable_progress=self.config.quiet,
+            stop_event=self._stop_event,
+            active_sessions=self._active_sessions,
+            sessions_lock=self._sessions_lock,
+            partials=self._partials,
+            partials_lock=self._partials_lock,
         )
 
     def stop(self) -> None:
