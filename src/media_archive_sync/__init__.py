@@ -3,7 +3,12 @@
 __version__ = "0.1.0"
 
 from .config import ArchiveConfig
-from .crawler import crawl_archive, fetch_directory, fetch_html
+from .crawler import (
+    crawl_archive,
+    fetch_directory,
+    fetch_html,
+    is_file_too_old_for_download,
+)
 from .downloader import (
     DownloadManager,
     download_file,
@@ -24,7 +29,12 @@ from .organizer import (
     load_local_index,
     organize_files_by_month,
 )
-from .strings import normalise_string, sanitize_title_for_filename, urldecode
+from .strings import (
+    normalise_stem,
+    normalise_string,
+    sanitize_title_for_filename,
+    urldecode,
+)
 
 __all__ = [
     "__version__",
@@ -32,8 +42,10 @@ __all__ = [
     "crawl_archive",
     "fetch_directory",
     "fetch_html",
+    "is_file_too_old_for_download",
     "urldecode",
     "normalise_string",
+    "normalise_stem",
     "sanitize_title_for_filename",
     "get_logger",
     "extract_epoch_from_name",

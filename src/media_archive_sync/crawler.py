@@ -97,7 +97,9 @@ def crawl_archive(
     prefix = base_url if start_dir else remote_base_normalized
 
     # Default video extensions if none provided
-    extensions = video_extensions or {".mp4", ".mkv", ".avi", ".mov", ".webm"}
+    if video_extensions is None:
+        video_extensions = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
+    extensions = video_extensions
     ext_pattern = "|".join(re.escape(ext.lstrip(".")) for ext in extensions)
 
     media_list: list[tuple[str, str]] = []
@@ -184,13 +186,15 @@ def fetch_directory(
         List of (full_url, decoded_basename) tuples for media files.
     """
     out: list[tuple[str, str]] = []
-    extensions = allowed_extensions or {".mp4", ".mkv", ".avi", ".mov", ".webm"}
+    if allowed_extensions is None:
+        allowed_extensions = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
+    extensions = allowed_extensions
     ext_pattern = "|".join(re.escape(ext.lstrip(".")) for ext in extensions)
     try:
         # Normalize dir_url to ensure it ends with a slash for safe urljoin
         normalized_dir_url = dir_url.rstrip("/") + "/"
         parsed_base = urllib.parse.urlparse(normalized_dir_url)
-        html = fetch_html(dir_url)
+        html = fetch_html(normalized_dir_url)
         if not html:
             return out
         soup = BeautifulSoup(html, "html.parser")

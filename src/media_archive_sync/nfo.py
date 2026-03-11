@@ -92,7 +92,7 @@ def build_movie_nfo(
     rating: float | None = None,
     original_title: str | None = None,
     releasedate: str | None = None,
-    collections: list[str] | None = None,
+    collections: StrCollection | None = None,
     uniqueid: dict[str, str] | None = None,
 ) -> str:
     """Build an NFO XML string from media metadata.
@@ -232,7 +232,9 @@ def build_movie_nfo(
     return ET.tostring(movie, encoding="unicode")
 
 
-def write_nfo_for_path(video_path, nfo_data: str, overwrite: bool = False) -> bool:
+def write_nfo_for_path(
+    video_path: str | Path, nfo_data: str, overwrite: bool = False
+) -> bool:
     """Write an NFO file for a media file.
 
     Writes the provided NFO XML content alongside the media file.

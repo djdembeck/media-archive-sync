@@ -137,7 +137,7 @@ def sanitize_title_for_filename(
     Args:
         title: The title string to sanitize.
         replacements: Optional dict of character replacements.
-        strip_tokens: Optional set of bang tokens to strip (e.g., {'gg', 'tts', 'ad'}).
+        strip_tokens: Optional set of bang tokens to strip (e.g., {\'gg\', \'tts\', \'ad\'}).
 
     Returns:
         A safe filename fragment, or "no.title" if result is empty.
@@ -169,3 +169,29 @@ def sanitize_title_for_filename(
         return "no.title"
 
     return s
+
+
+def normalise_stem(s: str) -> str:
+    """Normalise a filename stem for matching.
+
+    Normalizes without stripping a trailing dot-separated token, avoiding
+    treating a final ALLCAPS token as an extension. Intended for filesystem
+    stems (Path.stem).
+
+    Args:
+        s: The filename stem to normalize.
+
+    Returns:
+        The normalized stem in lower case with collapsed whitespace,
+        or empty string if input is not a string.
+
+    Raises:
+        TypeError: If s is not a string.
+    """
+    if not isinstance(s, str):
+        raise TypeError(f"Expected string, got {type(s).__name__}")
+
+    s = s.replace("_", " ")
+    s = re.sub(r"[^\w\s]", " ", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.lower().strip()
