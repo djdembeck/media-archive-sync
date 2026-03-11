@@ -114,7 +114,7 @@ def _strip_bang_tokens(title: str, tokens: set[str] | None = None) -> str:
             # Keep bang-prefixed tokens when they are at the start or
             # when they are not the final token; otherwise drop trailing
             # uppercase bang tokens which are likely metadata.
-            if i == 0 or i != len(toks) - 1:
+            if i == 0 or i != len(toks) - 1 or not p[1:].isupper():
                 parts.append(p)
             continue
 

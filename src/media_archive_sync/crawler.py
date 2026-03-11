@@ -144,16 +144,17 @@ def crawl_archive(
         dir_counts[dir_url] = 0
         for a in soup.find_all("a", href=True):
             href = a["href"]
-            if re.search(rf"\.({ext_pattern})$", href, re.I):
-                full_url = urllib.parse.urljoin(dir_url, href)
+            full_url = urllib.parse.urljoin(dir_url, href)
+            parsed_url = urllib.parse.urlparse(full_url)
+            parsed_path = parsed_url.path
+            if re.search(rf"\.({ext_pattern})$", parsed_path, re.I):
                 # Filter to only include URLs under the intended archive root
-                parsed_url = urllib.parse.urlparse(full_url)
                 parsed_base = urllib.parse.urlparse(remote_base_normalized)
                 if parsed_url.netloc != parsed_base.netloc:
                     continue
                 if not parsed_url.path.startswith(parsed_base.path):
                     continue
-                decoded_name = urldecode(Path(href).name)
+                decoded_name = urldecode(Path(parsed_path).name)
                 media_list.append((full_url, decoded_name))
                 dir_counts[dir_url] += 1
 
@@ -399,7 +400,7 @@ def is_file_too_old_for_download(
 
         # Convert epoch to datetime
         try:
-            if epoch > 1_000_000_000_000:  # Milliseconds
+            if epoch > 10_000_000_000:  # Milliseconds (values with >10 digits)
                 file_date = datetime.fromtimestamp(epoch / 1000, tz=UTC)
             else:
                 file_date = datetime.fromtimestamp(epoch, tz=UTC)

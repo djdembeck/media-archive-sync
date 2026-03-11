@@ -82,13 +82,13 @@ def build_movie_nfo(
     year: int | None = None,
     plot: str | None = None,
     director: str | None = None,
-    actors: list | None = None,
-    genres: list | None = None,
+    actors: list[str] | None = None,
+    genres: list[str] | None = None,
     runtime: int | None = None,
     rating: float | None = None,
     original_title: str | None = None,
     releasedate: str | None = None,
-    collections: list | None = None,
+    collections: list[str] | None = None,
     uniqueid: dict[str, str] | None = None,
 ) -> str:
     """Build an NFO XML string from media metadata.

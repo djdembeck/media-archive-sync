@@ -5,6 +5,7 @@ help:
 	@echo "  install-hooks  - Configure git to use hooks from .githooks/"
 	@echo "  dev-install    - Install package with dev dependencies"
 	@echo "  test           - Run tests"
+	@echo "  test-cov       - Run tests with coverage"
 	@echo "  lint           - Run ruff linter"
 	@echo "  format         - Run black formatter"
 	@echo "  clean          - Clean build artifacts"

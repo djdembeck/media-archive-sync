@@ -328,7 +328,10 @@ def safe_print(message: str, *args) -> None:
         *args: Arguments to format into the message.
     """
     if args:
-        message = message % args
+        try:
+            message = message % args
+        except (TypeError, ValueError):
+            message = message + " " + " ".join(map(str, args))
     print(message, file=sys.stderr)
 
 
