@@ -2,10 +2,13 @@
 """CLI for media-archive-sync."""
 
 import argparse
+import logging
 import urllib.parse
 from pathlib import Path
 
 from . import ArchiveConfig, crawl_archive, download_with_config
+
+logger = logging.getLogger(__name__)
 
 
 def main():
@@ -42,7 +45,8 @@ def main():
         max_depth=config.max_depth,
         video_extensions=config.video_extensions,
     )
-    print(f"Found {len(media_list)} files")
+    if not config.quiet:
+        logger.info("Found %d files", len(media_list))
 
     def _compute_target_path(url: str, local_root: Path) -> Path:
         parsed = urllib.parse.urlparse(url)
@@ -80,8 +84,23 @@ def main():
                 target_dir = config.local_root / month_folder
                 target_dir.mkdir(parents=True, exist_ok=True)
                 for filepath in file_list:
-                    target_path = target_dir / filepath.name
+                    # Calculate relative path from local_root to preserve subdir structure
+                    try:
+                        rel_path = filepath.relative_to(config.local_root)
+                        target_path = target_dir / rel_path
+                    except ValueError:
+                        # filepath not under local_root, fall back to basename
+                        target_path = target_dir / filepath.name
+
+                    original_stem = filepath.stem
+                    suffix = filepath.suffix
+                    counter = 1
+                    while target_path.exists() and target_path != filepath:
+                        target_path = target_dir / f"{original_stem}_{counter}{suffix}"
+                        counter += 1
+
                     if target_path != filepath:
+                        target_path.parent.mkdir(parents=True, exist_ok=True)
                         shutil.move(str(filepath), str(target_path))
 
 

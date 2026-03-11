@@ -131,19 +131,26 @@ def load_local_files(
                     if not p.is_file():
                         continue
 
-                    if p.name in mapping:
+                    # Use relative path from local_root as key to preserve
+                    # files with same name in different subdirectories
+                    try:
+                        rel_key = str(p.relative_to(local_root))
+                    except ValueError:
+                        rel_key = p.name
+
+                    if rel_key in mapping:
                         if use_mtime:
                             try:
-                                existing_list = mapping[p.name]
-                                # Keep only the most recent file per basename
+                                existing_list = mapping[rel_key]
+                                # Keep only the most recent file per relative path
                                 if p.stat().st_mtime > existing_list[0].stat().st_mtime:
-                                    mapping[p.name] = [p]
+                                    mapping[rel_key] = [p]
                             except (OSError, PermissionError):
-                                mapping[p.name].append(p)
+                                mapping[rel_key].append(p)
                         else:
-                            mapping[p.name].append(p)
+                            mapping[rel_key].append(p)
                     else:
-                        mapping[p.name] = [p]
+                        mapping[rel_key] = [p]
 
                     file_count += 1
                     if file_count % 1000 == 0:
