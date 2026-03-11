@@ -189,3 +189,76 @@ class TestWriteNfoForPath:
         result = write_nfo_for_path(video_path, nfo_data)
 
         assert result is True
+
+
+class TestBuildMovieNfoCollectionsFiltering:
+    """Tests for collections filtering and sorting."""
+
+    def test_collections_empty_after_filtering_no_wrapper(self):
+        """Test that empty collections don't create wrapper element."""
+        xml = build_movie_nfo(
+            title="Test Movie", collections=["", "   ", None, "Valid"]
+        )
+        root = ET.fromstring(xml)
+
+        collections = root.find("collections")
+        # Wrapper should still exist because we have one valid entry
+        assert collections is not None
+        sets = collections.findall("set")
+        assert len(sets) == 1
+        assert sets[0].text == "Valid"
+
+    def test_collections_all_empty_no_wrapper(self):
+        """Test that all-empty collections don't create wrapper."""
+        xml = build_movie_nfo(title="Test Movie", collections=["", "   ", None])
+        root = ET.fromstring(xml)
+
+        collections = root.find("collections")
+        assert collections is None
+
+    def test_collections_set_sorted_deterministically(self):
+        """Test that set collections are sorted for deterministic output."""
+        xml = build_movie_nfo(
+            title="Test Movie", collections={"Zebra", "Alpha", "Mike"}
+        )
+        root = ET.fromstring(xml)
+
+        collections = root.find("collections")
+        assert collections is not None
+        sets = collections.findall("set")
+        texts = [s.text for s in sets]
+        # Should be sorted alphabetically
+        assert texts == ["Alpha", "Mike", "Zebra"]
+
+    def test_collections_list_not_sorted(self):
+        """Test that list collections maintain original order."""
+        xml = build_movie_nfo(
+            title="Test Movie", collections=["Zebra", "Alpha", "Mike"]
+        )
+        root = ET.fromstring(xml)
+
+        collections = root.find("collections")
+        assert collections is not None
+        sets = collections.findall("set")
+        texts = [s.text for s in sets]
+        # Should maintain original order
+        assert texts == ["Zebra", "Alpha", "Mike"]
+
+    def test_collections_single_string(self):
+        """Test that single string collections work."""
+        xml = build_movie_nfo(title="Test Movie", collections="Single Collection")
+        root = ET.fromstring(xml)
+
+        collections = root.find("collections")
+        assert collections is not None
+        sets = collections.findall("set")
+        assert len(sets) == 1
+        assert sets[0].text == "Single Collection"
+
+    def test_collections_single_string_empty_no_wrapper(self):
+        """Test that empty string collection doesn't create wrapper."""
+        xml = build_movie_nfo(title="Test Movie", collections="   ")
+        root = ET.fromstring(xml)
+
+        collections = root.find("collections")
+        assert collections is None

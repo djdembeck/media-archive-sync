@@ -36,7 +36,9 @@ def fetch_html(url: str) -> str:
         The response HTML content, or empty string on failure.
     """
     try:
-        resp = requests.get(url, timeout=15)
+        resp = requests.get(
+            url, timeout=15, headers={"User-Agent": "media-archive-sync/1.0"}
+        )
         resp.raise_for_status()
         return resp.text
     except (requests.RequestException, TimeoutError, ConnectionError) as exc:
@@ -91,9 +93,8 @@ def crawl_archive(
 
     base_url = (start_dir or remote_base).rstrip("/") + "/"
     remote_base_normalized = (remote_base or base_url).rstrip("/") + "/"
-    base_url_normalized = base_url.rstrip("/") + "/"
     # Use base_url as prefix when start_dir is provided to limit scope
-    prefix = base_url_normalized if start_dir else remote_base_normalized
+    prefix = base_url if start_dir else remote_base_normalized
 
     # Default video extensions if none provided
     extensions = video_extensions or {".mp4", ".mkv", ".avi", ".mov", ".webm"}
@@ -216,7 +217,7 @@ def fetch_directory(
                 continue
             dec = urldecode(Path(parsed_full.path).name)
             out.append((full, dec))
-    except (requests.RequestException, Exception) as e:
+    except requests.RequestException as e:
         logger.debug("Failed to fetch directory listing %s: %s", dir_url, e)
     return out
 
@@ -246,7 +247,7 @@ def save_metadata(dir_url: str, media_meta_file: Path) -> None:
 
     try:
         head = requests.head(dir_url, timeout=8, allow_redirects=True)
-    except Exception:
+    except requests.RequestException:
         head = None
 
     etag = head.headers.get("ETag") if head and head.status_code < 400 else None
@@ -258,7 +259,7 @@ def save_metadata(dir_url: str, media_meta_file: Path) -> None:
         if resp.status_code < 400:
             h = hashlib.sha256(resp.content).hexdigest()
             html_hash = h
-    except Exception:
+    except requests.RequestException:
         html_hash = None
 
     meta[dir_url] = {
@@ -337,7 +338,6 @@ def filter_cached_index_for_period(
 def find_missing_to_append(
     cached_media: list[tuple[str, str]] | None,
     month_items: list[tuple[str, str]] | None,
-    periodic_dir: str,
 ) -> list[tuple[str, str]]:
     """Return month_items that are missing from cached_media.
 
@@ -349,7 +349,6 @@ def find_missing_to_append(
             already cached media, or None.
         month_items: List of (url, decoded_name) tuples from the current
             month directory, or None.
-        periodic_dir: Directory URL being processed (used for context).
 
     Returns:
         List of (url, decoded_name) tuples that are in month_items

@@ -132,3 +132,64 @@ class TestNoColor:
 
         # Just verify it exists and is a boolean
         assert isinstance(NO_COLOR, bool)
+
+
+class TestStderrIsTty:
+    """Tests for _stderr_is_tty function."""
+
+    def test_stderr_is_tty_with_custom_stream(self):
+        """Test _stderr_is_tty with custom stream parameter."""
+        from media_archive_sync.display import _stderr_is_tty
+
+        # StringIO doesn't have isatty
+        stream = StringIO()
+        result = _stderr_is_tty(stream)
+        assert result is False
+
+    def test_stderr_is_tty_with_none_uses_stderr(self):
+        """Test _stderr_is_tty with None uses sys.stderr."""
+        from media_archive_sync.display import _stderr_is_tty
+
+        # Should work without errors
+        result = _stderr_is_tty(None)
+        assert isinstance(result, bool)
+
+
+class TestSafePrintExtended:
+    """Extended tests for safe_print function."""
+
+    def test_safe_print_with_console_parameter(self):
+        """Test safe_print with console parameter."""
+        from unittest.mock import MagicMock
+
+        console = MagicMock()
+        safe_print("Test message", console=console)
+        console.print.assert_called_once_with("Test message")
+
+    def test_safe_print_formatting_with_multiple_args(self):
+        """Test safe_print with multiple formatting args."""
+        from io import StringIO
+        from unittest.mock import patch
+
+        stderr = StringIO()
+
+        with patch("media_archive_sync.display.sys.stderr", stderr):
+            safe_print("Hello %s and %s", "Alice", "Bob")
+
+        result = stderr.getvalue()
+        assert "Hello Alice and Bob" in result
+
+    def test_safe_print_formatting_failure(self):
+        """Test safe_print handles formatting errors gracefully."""
+        from io import StringIO
+        from unittest.mock import patch
+
+        stderr = StringIO()
+
+        with patch("media_archive_sync.display.sys.stderr", stderr):
+            # Invalid format string
+            safe_print("%s %s", "only_one_arg")
+
+        result = stderr.getvalue()
+        # Should still output something despite format error
+        assert len(result) > 0

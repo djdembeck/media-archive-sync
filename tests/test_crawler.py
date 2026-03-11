@@ -4,6 +4,7 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 from media_archive_sync.crawler import (
     crawl_archive,
@@ -78,7 +79,7 @@ class TestFetchDirectory:
         """Test handling of network errors."""
         with patch(
             "media_archive_sync.crawler.fetch_html",
-            side_effect=Exception("Network error"),
+            side_effect=requests.RequestException("Network error"),
         ):
             result = fetch_directory("http://example.com/dir/")
 
@@ -466,3 +467,110 @@ class TestCrawlArchive:
         # Only video.mp4 from example.com should be included
         assert len(media_list) == 1
         assert all("example.com" in url for url, _ in media_list)
+
+    def test_crawl_respects_start_dir_scope(self):
+        """Test that start_dir limits crawl scope correctly."""
+        # Simulate a structure where sibling dirs exist
+        root_html = """
+        <html><body>
+        <a href="jan/">jan/</a>
+        <a href="feb/">feb/</a>
+        <a href="video.mp4">video.mp4</a>
+        </body></html>
+        """
+        jan_html = """
+        <html><body>
+        <a href="video_jan.mp4">video_jan.mp4</a>
+        </body></html>
+        """
+        feb_html = """
+        <html><body>
+        <a href="video_feb.mp4">video_feb.mp4</a>
+        </body></html>
+        """
+
+        def mock_fetch(url):
+            if "/jan/" in url:
+                return jan_html
+            if "/feb/" in url:
+                return feb_html
+            return root_html
+
+        # When crawling with start_dir=jan, feb should be excluded
+        with patch("media_archive_sync.crawler.fetch_html", side_effect=mock_fetch):
+            result = crawl_archive(
+                start_dir="http://example.com/jan/",
+                remote_base="http://example.com/",
+            )
+
+        media_list, dir_counts = result
+        # Should only have jan video, not feb
+        assert len(media_list) == 1
+        assert "video_jan.mp4" in media_list[0][1]
+
+
+class TestFetchDirectorySecurity:
+    """Tests for fetch_directory security features."""
+
+    def test_fetch_directory_blocks_different_domain(self):
+        """Test that URLs from different domains are blocked."""
+        html = """
+        <html><body>
+        <a href="video.mp4">video.mp4</a>
+        <a href="http://evil.com/malware.mp4">malware.mp4</a>
+        </body></html>
+        """
+
+        with patch("media_archive_sync.crawler.fetch_html", return_value=html):
+            result = fetch_directory("http://example.com/dir/")
+
+        assert len(result) == 1
+        assert all("example.com" in url for url, _ in result)
+        assert all("evil.com" not in url for url, _ in result)
+
+    def test_fetch_directory_blocks_path_traversal(self):
+        """Test that path traversal is blocked."""
+        html = """
+        <html><body>
+        <a href="video.mp4">video.mp4</a>
+        <a href="/etc/passwd.mp4">passwd.mp4</a>
+        <a href="/other/path/video.mp4">other.mp4</a>
+        </body></html>
+        """
+
+        with patch("media_archive_sync.crawler.fetch_html", return_value=html):
+            result = fetch_directory("http://example.com/dir/")
+
+        # Should only include the video in the directory
+        assert len(result) == 1
+        assert "video.mp4" in result[0][1]
+
+    def test_fetch_directory_allows_same_host_relative(self):
+        """Test that relative URLs within same host are allowed."""
+        html = """
+        <html><body>
+        <a href="video.mp4">video.mp4</a>
+        </body></html>
+        """
+
+        with patch("media_archive_sync.crawler.fetch_html", return_value=html):
+            result = fetch_directory("http://example.com/dir/")
+
+        assert len(result) == 1
+        assert result[0][0].startswith("http://example.com/dir/")
+
+    def test_fetch_directory_handles_relative_href_parent(self):
+        """Test that relative URLs climbing up are blocked."""
+        html = """
+        <html><body>
+        <a href="video.mp4">video.mp4</a>
+        <a href="../sibling/video.mp4">sibling.mp4</a>
+        </body></html>
+        """
+
+        with patch("media_archive_sync.crawler.fetch_html", return_value=html):
+            result = fetch_directory("http://example.com/dir/")
+
+        # Only the video in the current directory should be included
+        assert len(result) == 1
+        assert "sibling" not in result[0][1]

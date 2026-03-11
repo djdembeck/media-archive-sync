@@ -9,11 +9,14 @@ import html
 import os
 import re
 import tempfile
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from .logging import get_logger
+
+StrCollection = str | Sequence[str] | set[str]
 
 logger = get_logger(__name__)
 
@@ -83,8 +86,8 @@ def build_movie_nfo(
     year: int | None = None,
     plot: str | None = None,
     director: str | None = None,
-    actors: list[str] | None = None,
-    genres: list[str] | None = None,
+    actors: StrCollection | None = None,
+    genres: StrCollection | None = None,
     runtime: int | None = None,
     rating: float | None = None,
     original_title: str | None = None,
@@ -263,6 +266,7 @@ def write_nfo_for_path(video_path, nfo_data: str, overwrite: bool = False) -> bo
             f.write(nfo_data)
         os.replace(temp_path, p)
     except Exception:
+        os.close(fd)
         with contextlib.suppress(OSError):
             os.unlink(temp_path)
         raise
