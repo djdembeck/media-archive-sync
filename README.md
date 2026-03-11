@@ -37,6 +37,15 @@ pip install git+https://github.com/djdembeck/media-archive-sync.git
 git clone https://github.com/djdembeck/media-archive-sync.git
 cd media-archive-sync
 pip install -e ".[dev]"
+
+# Enable git hooks (runs lint/tests automatically)
+git config --local core.hooksPath .githooks
+```
+
+Or use the Makefile for one-step setup:
+
+```bash
+make dev-install  # Installs deps and enables hooks
 ```
 
 ## Quick Start

@@ -93,7 +93,7 @@ def download_file(
                         head = _session.head(url, timeout=timeout, allow_redirects=True)
                         expected_size = int(head.headers.get("Content-Length", "-1"))
                         actual_size = temp_path.stat().st_size
-                        if expected_size > 0 and actual_size >= expected_size:
+                        if expected_size > 0 and actual_size == expected_size:
                             temp_path.replace(local_path)
                             return True, actual_size
                     except Exception:
@@ -108,6 +108,7 @@ def download_file(
                         progress_callback,
                         _stop_event,
                         _session,
+                        partial_ext,
                     )
 
                 response.raise_for_status()
@@ -116,12 +117,16 @@ def download_file(
                 total_size = -1
                 try:
                     total_size = int(response.headers.get("Content-Length", "-1"))
-                    if total_size >= 0 and start_byte > 0:
+                    if (
+                        response.status_code == 206
+                        and total_size >= 0
+                        and start_byte > 0
+                    ):
                         total_size += start_byte
                 except (ValueError, TypeError):
                     total_size = -1
 
-                downloaded = start_byte
+                downloaded = 0 if response.status_code == 200 else start_byte
 
                 with open(temp_path, mode) as f:
                     for chunk in response.iter_content(chunk_size=chunk_size):
@@ -224,7 +229,9 @@ def download_files(
         if skip_existing and local_path.is_file():
             try:
                 # Verify size match via HEAD request
-                head_response = requests.head(url, timeout=10, allow_redirects=True)
+                head_response = requests.head(
+                    url, timeout=timeout, allow_redirects=True
+                )
                 remote_size = int(head_response.headers.get("Content-Length", "-1"))
                 local_size = local_path.stat().st_size
 
@@ -268,7 +275,24 @@ def download_files(
                     url, stream=True, timeout=timeout, headers=headers
                 ) as response:
                     if response.status_code == 416:
-                        # Range unsatisfiable - restart
+                        # Range unsatisfiable - verify size before deleting
+                        try:
+                            head = session.head(
+                                url, timeout=timeout, allow_redirects=True
+                            )
+                            expected_size = int(
+                                head.headers.get("Content-Length", "-1")
+                            )
+                            if (
+                                temp_path.exists()
+                                and expected_size > 0
+                                and temp_path.stat().st_size == expected_size
+                            ):
+                                # File is complete, promote it
+                                temp_path.replace(local_path)
+                                return True, False
+                        except Exception:
+                            pass
                         temp_path.unlink(missing_ok=True)
                         continue
 

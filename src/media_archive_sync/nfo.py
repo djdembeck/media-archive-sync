@@ -4,6 +4,7 @@ This module provides functions to generate and write Kodi-compatible NFO XML
 files from media metadata dictionaries.
 """
 
+import contextlib
 import html
 import re
 from datetime import UTC, datetime
@@ -186,10 +187,8 @@ def build_movie_nfo(
             name = str(genre_name).strip()
             if not name:
                 continue
-            try:
+            with contextlib.suppress(ValueError):
                 name = html.unescape(name)
-            except Exception:
-                pass
             key = name.lower()
             if key not in seen_genres:
                 seen_genres.add(key)
@@ -234,16 +233,14 @@ def write_nfo_for_path(video_path, nfo_data: str, overwrite: bool = False) -> bo
                 if existing == nfo_data:
                     logger.debug("NFO unchanged, skipping: %s", p)
                     return False
-            except (OSError, IOError) as e:
+            except OSError as e:
                 # Read failed, log and proceed to attempt write
                 logger.warning("Cannot read existing NFO %s: %s", p, e)
         else:
             logger.info("Overwriting existing NFO: %s", p)
 
-    try:
+    with contextlib.suppress(OSError):
         p.parent.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
 
     p.write_text(nfo_data, encoding="utf-8")
     return True

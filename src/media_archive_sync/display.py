@@ -23,8 +23,7 @@ class _DummyTqdm:
 
     def __iter__(self):
         if self.iterable is not None:
-            for item in self.iterable:
-                yield item
+            yield from self.iterable
 
     def __enter__(self):
         return self

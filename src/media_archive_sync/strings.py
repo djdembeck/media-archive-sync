@@ -20,6 +20,8 @@ def urldecode(url: str) -> str:
     Raises:
         TypeError: If url is not a string.
     """
+    if not isinstance(url, str):
+        raise TypeError("url must be a str")
     return urllib.parse.unquote(url)
 
 

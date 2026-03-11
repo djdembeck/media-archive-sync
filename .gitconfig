@@ -1,0 +1,4 @@
+# Git configuration for media-archive-sync
+# This enables hooks to run automatically from the .githooks directory
+[core]
+    hooksPath = .githooks

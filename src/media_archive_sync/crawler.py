@@ -9,8 +9,10 @@ import json
 import re
 import urllib.parse
 from collections import deque
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import requests
 from bs4 import BeautifulSoup
@@ -47,7 +49,7 @@ def crawl_archive(
     remote_base: str | None = None,
     max_depth: int = 10,
     video_extensions: set | None = None,
-    progress_callback: callable | None = None,
+    progress_callback: Callable[..., Any] | None = None,
 ) -> tuple[list[tuple[str, str]], dict[str, int]]:
     """Walk the remote Apache index and collect media entries.
 

@@ -174,13 +174,16 @@ def merge_video_parts(
                 expected_duration += dur
 
         actual_duration = get_video_duration(output_path, ffprobe_path)
-        if expected_duration > 0 and actual_duration:
-            if abs(actual_duration - expected_duration) > 1.0:
-                logger.warning(
-                    "Merged file duration (%.2fs) differs from expected (%.2fs)",
-                    actual_duration,
-                    expected_duration,
-                )
+        if (
+            expected_duration > 0
+            and actual_duration
+            and abs(actual_duration - expected_duration) > 1.0
+        ):
+            logger.warning(
+                "Merged file duration (%.2fs) differs from expected (%.2fs)",
+                actual_duration,
+                expected_duration,
+            )
 
         logger.info("Successfully merged to: %s", output_path)
         return True

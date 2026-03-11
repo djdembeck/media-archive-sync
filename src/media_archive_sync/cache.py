@@ -6,6 +6,7 @@ JSON files or SQLite as the storage backend.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -97,10 +98,8 @@ class Cache:
     def _init_sqlite(self) -> None:
         """Initialize the SQLite database with WAL mode."""
         conn = sqlite3.connect(str(self.db_path), timeout=30)
-        try:
+        with contextlib.suppress(sqlite3.Error):
             conn.execute("PRAGMA journal_mode=WAL")
-        except sqlite3.Error:
-            pass
         conn.execute("""
             CREATE TABLE IF NOT EXISTS kv (
                 k TEXT PRIMARY KEY,
@@ -136,10 +135,8 @@ class Cache:
             if not self.db_path.is_file():
                 return None
             conn = sqlite3.connect(str(self.db_path), timeout=30)
-            try:
+            with contextlib.suppress(sqlite3.Error):
                 conn.execute("PRAGMA journal_mode=WAL")
-            except sqlite3.Error:
-                pass
             try:
                 cur = conn.cursor()
                 cur.execute("SELECT v FROM kv WHERE k=?", (key,))
@@ -205,10 +202,8 @@ class Cache:
 
         try:
             conn = sqlite3.connect(str(self.db_path), timeout=30)
-            try:
+            with contextlib.suppress(sqlite3.Error):
                 conn.execute("PRAGMA journal_mode=WAL")
-            except sqlite3.Error:
-                pass
             try:
                 cur = conn.cursor()
                 cur.execute(
@@ -235,18 +230,18 @@ class Cache:
                 )
                 temp_path = Path(temp_name)
                 with os.fdopen(temp_fd, "w", encoding="utf-8") as f:
+                    temp_fd = None  # fd ownership transferred to f
                     json.dump(wrapped, f, indent=2, ensure_ascii=False)
                     f.flush()
                     os.fsync(f.fileno())
                 temp_path.replace(path)
             except Exception:
-                if temp_path is not None and temp_path.exists():
-                    temp_path.unlink(missing_ok=True)
+                with contextlib.suppress(OSError):
+                    if temp_path is not None and temp_path.exists():
+                        temp_path.unlink(missing_ok=True)
                 if temp_fd is not None:
-                    try:
+                    with contextlib.suppress(OSError):
                         os.close(temp_fd)
-                    except OSError:
-                        pass
                 raise
         except (OSError, TypeError, ValueError) as exc:
             logger.warning("JSON set failed for key '%s': %s", key, exc)
@@ -421,7 +416,7 @@ class Cache:
 # Convenience functions for simple use cases
 
 
-def get_json(cache_dir: Path | str, key: str) -> Any | None:
+def get_cached(cache_dir: Path | str, key: str) -> Any | None:
     """Convenience function to get a value from SQLite cache.
 
     Args:
@@ -435,7 +430,7 @@ def get_json(cache_dir: Path | str, key: str) -> Any | None:
     return cache.get(key)
 
 
-def set_json(cache_dir: Path | str, key: str, value: Any) -> None:
+def set_cached(cache_dir: Path | str, key: str, value: Any) -> None:
     """Convenience function to set a value in SQLite cache.
 
     Args:
@@ -456,3 +451,8 @@ def delete_key(cache_dir: Path | str, key: str) -> None:
     """
     cache = Cache(cache_dir, backend="sqlite")
     cache.delete(key)
+
+
+# Backward compatibility aliases
+get_json = get_cached
+set_json = set_cached
