@@ -1,13 +1,29 @@
 """Media Archive Sync - Download and organize media from web archives."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
+from .cache import (
+    Cache,
+    delete_key,
+    get_cached,
+    load_media_index,
+    merge_overrides,
+    save_media_index,
+    set_cached,
+)
 from .config import ArchiveConfig
 from .crawler import (
     crawl_archive,
+    crawl_remote,
     fetch_directory,
     fetch_html,
+    fetch_remote_page,
+    filter_cached_index_for_period,
+    find_missing_to_append,
     is_file_too_old_for_download,
+    save_media_meta_for_dir,
+    save_metadata,
+    will_perform_full_crawl,
 )
 from .downloader import (
     DownloadManager,
@@ -17,22 +33,43 @@ from .downloader import (
 )
 from .logging import get_logger
 from .merge import (
+    cluster_by_epoch_window,
     detect_video_parts,
+    extract_epoch_from_filename,
     get_video_duration,
+    merge_multipart_group,
+    merge_multipart_videos,
     merge_video_parts,
+    order_parts_by_epoch,
+    should_merge_group,
+    should_merge_parts,
+)
+from .nfo import (
+    generate_nfo,
+    parse_release_date,
+    write_nfo_for_path,
 )
 from .organizer import (
     extract_date_from_epoch,
     extract_epoch_from_name,
+    extract_epoch_from_name_zero,
     get_target_path,
     load_local_files,
+    load_local_files_single,
     load_local_index,
+    load_local_nfo_index,
     organize_files_by_month,
+    persist_local_index_entry,
+    resolve_override_key,
+    should_skip_overwrite_local_nfo,
+    update_local_index_entries,
 )
 from .strings import (
     normalise_stem,
     normalise_string,
+    sanitize_dir_name,
     sanitize_title_for_filename,
+    server_basename_variants,
     urldecode,
 )
 
@@ -40,20 +77,36 @@ __all__ = [
     "__version__",
     "ArchiveConfig",
     "crawl_archive",
+    "crawl_remote",
     "fetch_directory",
     "fetch_html",
+    "fetch_remote_page",
+    "filter_cached_index_for_period",
+    "find_missing_to_append",
     "is_file_too_old_for_download",
+    "save_media_meta_for_dir",
+    "save_metadata",
+    "will_perform_full_crawl",
     "urldecode",
     "normalise_string",
     "normalise_stem",
+    "sanitize_dir_name",
     "sanitize_title_for_filename",
+    "server_basename_variants",
     "get_logger",
     "extract_epoch_from_name",
+    "extract_epoch_from_name_zero",
     "extract_date_from_epoch",
     "load_local_files",
+    "load_local_files_single",
     "load_local_index",
+    "load_local_nfo_index",
     "organize_files_by_month",
     "get_target_path",
+    "persist_local_index_entry",
+    "update_local_index_entries",
+    "resolve_override_key",
+    "should_skip_overwrite_local_nfo",
     "download_file",
     "download_files",
     "download_with_config",
@@ -61,4 +114,21 @@ __all__ = [
     "merge_video_parts",
     "detect_video_parts",
     "get_video_duration",
+    "cluster_by_epoch_window",
+    "should_merge_group",
+    "merge_multipart_group",
+    "merge_multipart_videos",
+    "should_merge_parts",
+    "extract_epoch_from_filename",
+    "order_parts_by_epoch",
+    "generate_nfo",
+    "parse_release_date",
+    "write_nfo_for_path",
+    "Cache",
+    "load_media_index",
+    "save_media_index",
+    "merge_overrides",
+    "get_cached",
+    "set_cached",
+    "delete_key",
 ]

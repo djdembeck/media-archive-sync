@@ -7,6 +7,22 @@ making them easy to test and reuse across the codebase.
 import re
 import urllib.parse
 
+_DEFAULT_VIDEO_EXTENSIONS = frozenset(
+    {
+        ".mp4",
+        ".mkv",
+        ".avi",
+        ".mov",
+        ".webm",
+        ".m4v",
+        ".mpg",
+        ".mpeg",
+        ".flv",
+        ".wmv",
+        ".ts",
+    }
+)
+
 
 def urldecode(url: str) -> str:
     """Decode a percent-encoded URL string.
@@ -25,7 +41,10 @@ def urldecode(url: str) -> str:
     return urllib.parse.unquote(url)
 
 
-def normalise_string(s: str) -> str:
+def normalise_string(
+    s: str,
+    video_extensions: set[str] | None = None,
+) -> str:
     """Lower-case, strip punctuation, collapse whitespace.
 
     Used to compare titles with server filenames. Strips file extensions
@@ -33,6 +52,9 @@ def normalise_string(s: str) -> str:
 
     Args:
         s: The string to normalize.
+        video_extensions: Set of video extensions to strip (e.g., {'mp4', 'mkv'}).
+            When None (default), strips a built-in set of common media extensions.
+            When provided, only extensions in the set are stripped.
 
     Returns:
         The normalized string in lower case with collapsed whitespace.
@@ -41,24 +63,17 @@ def normalise_string(s: str) -> str:
     if not s or not isinstance(s, str):
         return ""
 
-    # Common video file extensions to strip when normalizing filenames
-    video_extensions = {
-        "mp4",
-        "mkv",
-        "avi",
-        "mov",
-        "webm",
-        "m4v",
-        "mpg",
-        "mpeg",
-        "flv",
-        "wmv",
-    }
-    # Check if string ends with a known video extension
-    if "." in s:
-        ext = s.rsplit(".", 1)[1].lower()
-        if ext in video_extensions:
-            s = s.rsplit(".", 1)[0]
+    if video_extensions is not None:
+        # Explicit set: only strip known extensions
+        if "." in s:
+            ext = s.rsplit(".", 1)[1].lower()
+            if ext in video_extensions:
+                s = s.rsplit(".", 1)[0]
+    else:
+        if "." in s:
+            ext = s.rsplit(".", 1)[1].lower()
+            if f".{ext}" in _DEFAULT_VIDEO_EXTENSIONS:
+                s = s.rsplit(".", 1)[0]
 
     # Replace punctuation with spaces so separators (.,-, etc.) become word
     # boundaries instead of being removed and gluing words together.
@@ -69,7 +84,11 @@ def normalise_string(s: str) -> str:
     return s.lower().strip()
 
 
-def _strip_bang_tokens(title: str, tokens: set[str] | None = None) -> str:
+def _strip_bang_tokens(
+    title: str,
+    tokens: set[str] | None = None,
+    strict_tokens: bool = True,
+) -> str:
     """Remove bang operator tokens like '!gg', '!tts', '!ad' and trailing
     '!tag' suffixes (case-insensitive).
 
@@ -79,6 +98,10 @@ def _strip_bang_tokens(title: str, tokens: set[str] | None = None) -> str:
         title: The string to strip bang tokens from.
         tokens: Set of bang tokens to strip (e.g., {'gg', 'tts', 'ad'}).
             If None, uses an empty set.
+        strict_tokens: When True (default), strip only suffixes that match
+            the provided *tokens* set (existing library behaviour). When
+            False, strip ANY lowercase suffix after '!' — this matches the
+            lenient behaviour of the legacy local implementation.
 
     Returns:
         The string with bang tokens removed, or original string on error.
@@ -99,8 +122,13 @@ def _strip_bang_tokens(title: str, tokens: set[str] | None = None) -> str:
             idx = p.rfind("!")
             prefix = p[:idx]
             suffix = p[idx + 1 :]
-            # Only strip explicit bang tokens, not all lowercase suffixes
-            is_known = suffix.lower() in bang_tokens
+            if strict_tokens:
+                # Only strip explicit bang tokens, not all lowercase suffixes
+                is_known = suffix.lower() in bang_tokens
+            else:
+                is_known = suffix.lower() in bang_tokens or (
+                    suffix.isalnum() and not suffix.isupper()
+                )
             if suffix and is_known:
                 if prefix:
                     parts.append(prefix)
@@ -110,6 +138,8 @@ def _strip_bang_tokens(title: str, tokens: set[str] | None = None) -> str:
         if p.startswith("!"):
             tag = p[1:]
             if tag.lower() in bang_tokens:
+                continue
+            if not strict_tokens and (tag.isalnum() and not tag.isupper()):
                 continue
             # Keep bang-prefixed tokens when they are at the start or
             # when they are not the final token; otherwise drop trailing
@@ -195,3 +225,117 @@ def normalise_stem(s: str) -> str:
     s = re.sub(r"[^\w\s]", " ", s)
     s = re.sub(r"\s+", " ", s)
     return s.lower().strip()
+
+
+_WINDOWS_RESERVED = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{i}" for i in range(1, 10)),
+        *(f"LPT{i}" for i in range(1, 10)),
+    }
+)
+_MAX_DIR_NAME_LENGTH = 255
+
+
+def sanitize_dir_name(name: object | None = None) -> str:
+    """Sanitize a collection name into a safe directory name.
+
+    Strips characters illegal in directory names (slashes, colons,
+    leading/trailing dots and spaces) while preserving spaces and
+    most punctuation. Also strips null bytes, control characters,
+    and enforces filesystem length limits.
+
+    Note on '/' handling: forward slashes are replaced with ' - ' because
+    they represent path separators, so preserving the semantic meaning as a
+    separator makes sense. Other illegal characters (colons, asterisks, etc.)
+    are simply removed since they have no meaningful separator interpretation.
+
+    Args:
+        name: The collection name to sanitize (accepts None or non-string).
+
+    Returns:
+        A sanitized safe directory name, or "Untitled" if input is empty.
+    """
+    if name is None:
+        return "Untitled"
+    if not isinstance(name, str):
+        name = str(name)
+
+    if not name or not name.strip():
+        return "Untitled"
+
+    s = name.strip()
+    s = re.sub(r"[\x00-\x1f\x7f]", "", s)
+    s = s.replace("/", " - ")
+    s = re.sub(r'[\\:*?"<>|]', "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    s = s.strip(". ")
+
+    if s.upper().split(".")[0] in _WINDOWS_RESERVED:
+        s = f"_{s}"
+
+    while True:
+        try:
+            if len(s.encode("utf-8")) <= _MAX_DIR_NAME_LENGTH:
+                break
+        except UnicodeEncodeError:
+            pass
+        s = s[:-1]
+    s = s.rstrip(". ")
+
+    return s or "Untitled"
+
+
+def server_basename_variants(
+    name: str,
+    bang_tokens: set[str] | None = None,
+) -> list[str]:
+    """Return plausible basename variants for a server filename.
+
+    Used by orphan-JSON fallback to try matching moved files whose server
+    names contain day prefixes, epoch suffixes or operator-like tokens.
+
+    Args:
+        name: The server filename to generate variants for.
+        bang_tokens: Set of bang tokens to strip from variants
+            (e.g., {'gg', 'tts', 'ad'}). If None, no token-based
+            stripping is performed.
+
+    Returns:
+        A list of unique basename variants.
+    """
+    out: list[str] = []
+    if not name:
+        return out
+
+    tokens = bang_tokens if bang_tokens is not None else set()
+
+    try:
+        base: str = str(name).rsplit(".", 1)[0]
+        out.append(base)
+        out.append(re.sub(r"^\d+_", "", base))
+        out.append(re.sub(r"_(\d{1,4})$", "", base))
+        out.append(re.sub(r"_(\d{9,13}(?:_\d+)?)$", "", base))
+        v: str = re.sub(r"^\d+_", "", base)
+        v = re.sub(r"_(\d{9,13}(?:_\d+)?)$", "", v)
+        out.append(v)
+        for tok in list(tokens):
+            try:
+                pat = re.compile(rf"[\._-]?{re.escape(tok)}$", re.I)
+                out.append(re.sub(pat, "", base))
+                out.append(re.sub(pat, "", v))
+            except re.error:
+                continue
+    except AttributeError:
+        pass
+
+    seen: set[str] = set()
+    res: list[str] = []
+    for x in out:
+        if x and x not in seen:
+            seen.add(x)
+            res.append(x)
+    return res

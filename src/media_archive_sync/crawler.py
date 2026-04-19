@@ -2,6 +2,18 @@
 
 This module contains functions for fetching and parsing remote Apache directory
 listings, crawling the archive structure, and managing HTTP requests.
+
+Two families of functions are provided:
+
+* **Core functions** (``crawl_archive``, ``fetch_directory``, ``save_metadata``,
+  etc.) offer full control over every parameter.
+* **Convenience wrappers** (``crawl_remote``, ``fetch_remote_page``,
+  ``save_media_meta_for_dir``) supply sensible defaults so callers can get
+  started quickly.
+
+Several functions accept a ``match_by`` or ``normalize_keys`` parameter that
+switches between the library's strict matching semantics and the more lenient
+behaviour used by the legacy local implementation.
 """
 
 import hashlib
@@ -309,6 +321,7 @@ def filter_cached_index_for_period(
     media_list: list[tuple[str, str]] | None,
     dir_counts: dict[str, int] | None,
     periodic_dir: str | None,
+    normalize_keys: bool = True,
 ) -> tuple[list[tuple[str, str]], dict[str, int], bool]:
     """Return (media_list, dir_counts, prepared) filtered to period.
 
@@ -319,6 +332,9 @@ def filter_cached_index_for_period(
         media_list: List of (url, decoded_name) tuples or None.
         dir_counts: Mapping of directory URLs to file counts or None.
         periodic_dir: Directory URL to filter to, or None for no filtering.
+        normalize_keys: If True (default), normalize dir_counts keys by
+            ensuring trailing slashes before lookup. If False, keys are
+            used as-is (matching the legacy local implementation).
 
     Returns:
         Tuple of (filtered_media_list, filtered_dir_counts, prepared_flag).
@@ -331,18 +347,30 @@ def filter_cached_index_for_period(
         return media_list or [], dict(dir_counts or {}), False
     media_list = media_list or []
     dir_counts = dict(dir_counts or {})
-    normalized_periodic = periodic_dir.rstrip("/") + "/"
-    # Normalize dir_counts keys for consistent lookup
-    normalized_dir_counts = {k.rstrip("/") + "/": v for k, v in dir_counts.items()}
-    if normalized_periodic in normalized_dir_counts:
-        filtered = [it for it in media_list if it[0].startswith(normalized_periodic)]
-        return filtered, {normalized_periodic: len(filtered)}, True
+
+    if normalize_keys:
+        normalized_periodic = periodic_dir.rstrip("/") + "/"
+        normalized_dir_counts = {k.rstrip("/") + "/": v for k, v in dir_counts.items()}
+        if (
+            normalized_periodic in normalized_dir_counts
+            and normalized_dir_counts[normalized_periodic] > 0
+        ):
+            filtered = [
+                it for it in media_list if it[0].startswith(normalized_periodic)
+            ]
+            return filtered, {normalized_periodic: len(filtered)}, True
+    else:
+        if periodic_dir in dir_counts and dir_counts.get(periodic_dir, 0) > 0:
+            filtered = [it for it in media_list if it[0].startswith(periodic_dir)]
+            return filtered, {periodic_dir: len(filtered)}, True
+
     return media_list, dir_counts, False
 
 
 def find_missing_to_append(
     cached_media: list[tuple[str, str]] | None,
     month_items: list[tuple[str, str]] | None,
+    match_by: str = "tuple",
 ) -> list[tuple[str, str]]:
     """Return month_items that are missing from cached_media.
 
@@ -354,24 +382,38 @@ def find_missing_to_append(
             already cached media, or None.
         month_items: List of (url, decoded_name) tuples from the current
             month directory, or None.
+        match_by: How to determine whether an item is "existing".
+            ``"tuple"`` (default) matches by the full (url, name) tuple,
+            so the same filename at a different URL is considered new.
+            ``"name"`` matches by decoded_name only, so any cached entry
+            with the same name suppresses the new item regardless of URL.
 
     Returns:
         List of (url, decoded_name) tuples that are in month_items
         but not in cached_media.
     """
-    existing = set(cached_media or [])
-    to_append: list[tuple[str, str]] = []
-    for item in month_items or []:
-        if item not in existing:
-            to_append.append(item)
-    return to_append
+    if match_by == "name":
+        existing = {n for _, n in (cached_media or [])}
+        to_append: list[tuple[str, str]] = []
+        for full, dec in month_items or []:
+            if dec not in existing:
+                to_append.append((full, dec))
+        return to_append
+    elif match_by == "tuple":
+        existing = set(cached_media or [])
+        return [item for item in (month_items or []) if item not in existing]
+    else:
+        raise ValueError(
+            f"Unknown match_by value: {match_by!r}. Expected 'tuple' or 'name'."
+        )
 
 
 def is_file_too_old_for_download(
     url: str,
     decoded_name: str,
-    max_age_days: int = 0,
+    max_age_days: int | None = None,
     allow_old_downloads: bool = False,
+    fail_closed: bool = False,
 ) -> bool:
     """Check if a file is too old to be downloaded based on age limits.
 
@@ -381,45 +423,47 @@ def is_file_too_old_for_download(
     Args:
         url: The URL of the remote file to check.
         decoded_name: The decoded filename to extract timestamp from.
-        max_age_days: Maximum age in days (0 = no limit).
+        max_age_days: Maximum age in days (None or 0 = no limit, positive
+            integer = age limit in days).
         allow_old_downloads: If True, skip the age check entirely.
+        fail_closed: If True, return True (skip download) when
+            max_age_days or allow_old_downloads are not explicitly
+            provided and default to their "no-op" values. This mirrors
+            the legacy local implementation's config-sentinel behaviour
+            where missing configuration causes downloads to be blocked.
 
     Returns:
         bool: True if the file should be skipped because it exceeds
             max_age_days, False otherwise.
     """
-    # Skip check if old downloads are explicitly allowed
+    if fail_closed and max_age_days is None and not allow_old_downloads:
+        return True
+
     if allow_old_downloads:
         return False
 
-    if max_age_days <= 0:
+    if max_age_days is None or max_age_days <= 0:
         return False
 
     try:
-        # Extract epoch from URL or filename
         epoch = None
-        # Try URL first
         m = re.search(r"/(\d{9,13})/", url)
         if m:
             epoch = int(m.group(1))
-        # Try filename
         if epoch is None:
             m = re.search(r"_(\d{9,13})_", decoded_name)
             if m:
                 epoch = int(m.group(1))
-        # Last resort: any 9-13 digit sequence
         if epoch is None:
             m = re.search(r"(\d{9,13})", url)
             if m:
                 epoch = int(m.group(1))
 
         if epoch is None:
-            # Can't determine age, allow download
             return False
 
-        # Convert epoch to datetime
         try:
-            if epoch > 10_000_000_000:  # Milliseconds (values with >10 digits)
+            if epoch > 10_000_000_000:
                 file_date = datetime.fromtimestamp(epoch / 1000, tz=UTC)
             else:
                 file_date = datetime.fromtimestamp(epoch, tz=UTC)
@@ -427,7 +471,6 @@ def is_file_too_old_for_download(
             logger.debug("Failed to convert epoch %s to datetime: %s", epoch, e)
             return False
 
-        # Calculate age
         now = datetime.now(UTC)
         age_days = (now - file_date).days
 
@@ -436,3 +479,85 @@ def is_file_too_old_for_download(
     except (TypeError, ValueError) as e:
         logger.debug("Error checking file age: %s", e)
         return False
+
+
+def crawl_remote(
+    remote_base: str,
+    start_dir: str | None = None,
+    max_depth: int = 4,
+    video_extensions: set[str] | None = None,
+    progress_callback: Callable[..., Any] | None = None,
+) -> tuple[list[tuple[str, str]], dict[str, int]]:
+    """Crawl a remote archive with sensible defaults.
+
+    Convenience wrapper around :func:`crawl_archive` that supplies
+    commonly-used defaults (``max_depth=4``, default video extensions).
+
+    Args:
+        remote_base: Base URL of the remote archive.
+        start_dir: Optional starting directory URL (defaults to remote_base).
+        max_depth: Maximum directory depth to crawl (default 4).
+        video_extensions: Set of video file extensions to look for.
+        progress_callback: Optional callback function(dir_url, depth).
+
+    Returns:
+        Tuple of (media_list, dir_counts) — same as :func:`crawl_archive`.
+    """
+    return crawl_archive(
+        start_dir=start_dir,
+        remote_base=remote_base,
+        max_depth=max_depth,
+        video_extensions=video_extensions,
+        progress_callback=progress_callback,
+    )
+
+
+def fetch_remote_page(dir_url: str) -> list[tuple[str, str]]:
+    """Fetch a single remote directory listing without extension filtering.
+
+    Unlike :func:`fetch_directory`, this function returns **all** non-directory
+    entries (not just those with video extensions), matching the behaviour of
+    the legacy local ``fetch_dir_listing`` implementation.
+
+    Args:
+        dir_url: The URL of the directory to fetch.
+
+    Returns:
+        List of (full_url, decoded_basename) tuples for all files.
+    """
+    out: list[tuple[str, str]] = []
+    try:
+        normalized_dir_url = dir_url.rstrip("/") + "/"
+        parsed_base = urllib.parse.urlparse(normalized_dir_url)
+        html = fetch_html(normalized_dir_url)
+        if not html:
+            return out
+        soup = BeautifulSoup(html, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href in ("../", "./"):
+                continue
+            if href.endswith("/"):
+                continue
+            full = urllib.parse.urljoin(normalized_dir_url, href)
+            parsed_full = urllib.parse.urlparse(full)
+            if parsed_full.netloc != parsed_base.netloc:
+                continue
+            base_path = parsed_base.path.rstrip("/") + "/"
+            if not parsed_full.path.startswith(base_path):
+                continue
+            dec = urldecode(Path(parsed_full.path).name)
+            out.append((full, dec))
+    except (requests.RequestException, ValueError, OSError) as e:
+        logger.debug("Failed to fetch remote page %s: %s", dir_url, e)
+    return out
+
+
+def save_media_meta_for_dir(dir_url: str, media_meta_file: Path) -> None:
+    """Fetch HEAD and HTML for a directory and persist metadata.
+
+    Alias for :func:`save_metadata` that matches the legacy local
+    naming convention.  See :func:`save_metadata` for full
+    documentation.
+    """
+    save_metadata(dir_url, media_meta_file)

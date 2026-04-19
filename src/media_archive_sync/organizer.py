@@ -5,9 +5,16 @@ Key functions include file system crawling, epoch extraction from filenames, fil
 management, and organization by month folders.
 
 Key functions:
-    - extract_epoch_from_name: Extract 9-13 digit epoch from filename
-    - load_local_files: Scan and index files in local directories
+    - extract_epoch_from_name: Extract 9-13 digit epoch from filename (returns None on miss)
+    - extract_epoch_from_name_zero: Extract epoch, returning 0 on miss (local compat)
+    - load_local_files: Scan and index files, returning Dict[str, list[Path]]
+    - load_local_files_single: Scan and index files, returning Dict[str, Path]
+    - load_local_nfo_index: Build index of NFO sidecar files
     - load_local_index: Cached version of load_local_files with JSON persistence
+    - persist_local_index_entry: Persist a single entry to cache
+    - update_local_index_entries: Update cache with added/removed files
+    - resolve_override_key: Resolve filename against local override mappings
+    - should_skip_overwrite_local_nfo: Check if NFO overwrite should be skipped
     - organize_files_by_month: Organize files into month-based folders
 
 Usage notes:
@@ -18,12 +25,16 @@ Usage notes:
 import json
 import os
 import re
+import sqlite3
 import time
+import urllib.parse
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
+from .cache import Cache
 from .logging import get_logger
-from .strings import sanitize_title_for_filename
+from .strings import normalise_string, sanitize_title_for_filename
 
 logger = get_logger(__name__)
 
@@ -66,6 +77,111 @@ def extract_epoch_from_name(name: str) -> int | None:
         )
 
     return None
+
+
+def extract_epoch_from_name_zero(name: str) -> int:
+    """Extract a 9-13 digit epoch timestamp from a filename, returning 0 on miss.
+
+    This is the local-compatible variant of extract_epoch_from_name.
+    The library's extract_epoch_from_name returns None on miss; this
+    returns 0, matching the original local implementation's contract.
+
+    Args:
+        name: The filename to search.
+
+    Returns:
+        The extracted epoch as an integer, or 0 if not found.
+    """
+    result = extract_epoch_from_name(name)
+    return result if result is not None else 0
+
+
+def resolve_override_key(
+    local_overrides: dict[str, str] | None, name: str
+) -> str | None:
+    """Resolve a filename against local override mappings.
+
+    Tries exact match, URL-decoded match, basename match, and
+    normalised substring match in order.
+
+    Args:
+        local_overrides: Mapping of override keys to values.
+        name: The filename to resolve.
+
+    Returns:
+        The matching override key, or None if no match found.
+    """
+    if not local_overrides or not name:
+        return None
+    try:
+        candidates = [
+            name,
+            urllib.parse.unquote(name),
+            os.path.basename(name),
+        ]
+        for c in candidates:
+            if c in local_overrides:
+                return c
+
+        n_norm = normalise_string(name)
+        for k in local_overrides:
+            try:
+                k_norm = normalise_string(k)
+                if k_norm == n_norm:
+                    if isinstance(k, str):
+                        return k
+                    return str(k)
+                if len(k_norm) >= 4 and (k_norm in n_norm or n_norm in k_norm):
+                    if isinstance(k, str):
+                        return k
+                    return str(k)
+            except (TypeError, ValueError) as e:
+                logger.debug(
+                    "resolve_override_key: normalization failed for key '%s': %s",
+                    k,
+                    e,
+                )
+                continue
+    except (TypeError, AttributeError, ValueError) as e:
+        logger.debug(
+            "resolve_override_key: failed to resolve key for '%s': %s", name, e
+        )
+        return None
+    return None
+
+
+def should_skip_overwrite_local_nfo(
+    media_candidate: Path | str, args_obj: Any | None = None
+) -> bool:
+    """Check whether NFO overwrite should be skipped for the given media file.
+
+    Multipart files (part/cd/disc) always skip overwrite regardless of flags.
+    For non-multipart files, returns True (skip) unless either overwrite_nfo
+    or ask_to_overwrite_local_nfo is truthy.
+
+    Args:
+        media_candidate: Path or string of the media file to check.
+        args_obj: Optional args namespace with overwrite_nfo and/or
+            ask_to_overwrite_local_nfo attributes.
+
+    Returns:
+        True if overwrite should be skipped, False otherwise.
+    """
+    try:
+        p_stem = Path(media_candidate).stem if media_candidate else ""
+    except (TypeError, ValueError):
+        p_stem = str(media_candidate or "")
+    try:
+        if re.search(r"(?:[_.-](?:part|cd|disc)0*\d+$)", p_stem, re.IGNORECASE):
+            return True
+    except (re.error, ValueError):
+        pass
+    try:
+        overwrite = getattr(args_obj, "overwrite_nfo", False)
+        legacy = getattr(args_obj, "ask_to_overwrite_local_nfo", False)
+        return not (bool(overwrite) or bool(legacy))
+    except AttributeError:
+        return True
 
 
 def extract_date_from_epoch(epoch: int) -> datetime | None:
@@ -173,6 +289,226 @@ def load_local_files(
     return mapping
 
 
+def load_local_files_single(
+    local_root: Path,
+    video_extensions: set[str] | None = None,
+) -> dict[str, Path]:
+    """Scan local directories and build a filename-to-path mapping (single path per name).
+
+    Unlike load_local_files which returns Dict[str, list[Path]], this returns
+    Dict[str, Path] — one path per filename. When duplicates exist, the file
+    with the most recent modification time wins. Also adds cleaned-name aliases
+    (collapsed whitespace) as additional keys.
+
+    This matches the local implementation's contract for callers that only
+    need a single path per filename.
+
+    Args:
+        local_root: Base local directory to scan.
+        video_extensions: Optional set of extensions to filter by
+            (e.g., {'.mp4', '.mkv'}). If None, all files are indexed.
+
+    Returns:
+        Dictionary mapping filenames to single Path objects.
+    """
+    mapping: dict[str, Path] = {}
+
+    if not local_root.exists():
+        logger.warning("Local root does not exist: %s", local_root)
+        return mapping
+
+    file_count = 0
+
+    try:
+        for dirpath, _dirnames, filenames in os.walk(str(local_root)):
+            for fname in filenames:
+                try:
+                    if video_extensions:
+                        ext = Path(fname).suffix.lower()
+                        if ext not in video_extensions:
+                            continue
+
+                    p = Path(dirpath) / fname
+                    if not p.is_file():
+                        continue
+
+                    if p.name in mapping:
+                        try:
+                            prev = mapping[p.name]
+                            if p.stat().st_mtime > prev.stat().st_mtime:
+                                mapping[p.name] = p
+                        except (OSError, PermissionError):
+                            mapping[p.name] = p
+                    else:
+                        mapping[p.name] = p
+
+                    try:
+                        cleaned = re.sub(r"\s+", " ", p.name).replace("\n", " ").strip()
+                        if cleaned and cleaned != p.name:
+                            if cleaned in mapping and mapping[cleaned] != p:
+                                logger.debug(
+                                    "Cleaned-name collision: %r maps to %s, overwriting %s",
+                                    cleaned,
+                                    p,
+                                    mapping[cleaned],
+                                )
+                            mapping[cleaned] = p
+                    except (re.error, ValueError):
+                        pass
+
+                    file_count += 1
+                    if file_count % 1000 == 0:
+                        logger.info(
+                            "Indexed %d files so far (scanning %s)",
+                            file_count,
+                            local_root,
+                        )
+                except (OSError, PermissionError):
+                    continue
+    except KeyboardInterrupt:
+        logger.info(
+            "Local scan interrupted by user; returning partial index (%d files)",
+            file_count,
+        )
+    except (OSError, PermissionError) as e:
+        logger.warning("Error scanning local files: %s", e)
+
+    logger.info("Found %d existing local files in %s", len(mapping), local_root)
+    return mapping
+
+
+def load_local_nfo_index(
+    local_root: Path,
+    cache_dir: Path | None = None,
+    use_cache: bool = True,
+) -> set[str]:
+    """Build an index of NFO sidecar files in the local directory.
+
+    Scans for .nfo files and optionally caches the results via the
+    library's Cache (SQLite) backend.
+
+    Args:
+        local_root: Base local directory to scan.
+        cache_dir: Optional cache directory for SQLite backend.
+        use_cache: Whether to use/load from cache.
+
+    Returns:
+        Set of absolute NFO file paths as strings.
+    """
+    nfo_paths: set[str] = set()
+    cache: Cache | None = None
+
+    if use_cache and cache_dir is not None:
+        try:
+            cache = Cache(cache_dir, backend="sqlite")
+            cached_data = cache.get("local_nfo_index")
+            if cached_data and isinstance(cached_data, list):
+                nfo_paths = set(cached_data)
+                logger.debug("Loaded NFO index from cache: %d entries", len(nfo_paths))
+                return nfo_paths
+        except Exception as err:
+            logger.debug("Failed to load NFO index from cache: %s", err)
+            cache = None
+
+    try:
+        logger.info("Building NFO index for %s...", local_root)
+        for nfo in local_root.rglob("*.nfo"):
+            try:
+                if nfo.is_file():
+                    nfo_paths.add(str(nfo.resolve()))
+            except (OSError, PermissionError):
+                continue
+        logger.info("Built NFO index: %d files", len(nfo_paths))
+
+        if use_cache and cache_dir is not None:
+            try:
+                if cache is None:
+                    cache = Cache(cache_dir, backend="sqlite")
+                cache.set("local_nfo_index", list(nfo_paths))
+                logger.debug("Cached NFO index (%d entries)", len(nfo_paths))
+            except Exception as err:
+                logger.debug("Failed to cache NFO index: %s", err)
+    except (OSError, PermissionError) as exc:
+        logger.warning("Failed to build NFO index: %s", exc)
+
+    return nfo_paths
+
+
+def persist_local_index_entry(
+    local_path: str | Path,
+    cache_dir: Path,
+) -> None:
+    """Persist a single local file entry to the cache.
+
+    Args:
+        local_path: Path to the local file to index.
+        cache_dir: Cache directory for SQLite backend.
+    """
+    try:
+        cache = Cache(cache_dir, backend="sqlite")
+        current = cache.get("local_index") or {}
+        if not isinstance(current, dict):
+            current = {}
+        current[Path(local_path).name] = str(local_path)
+        cache.set("local_index", current)
+    except Exception as e:
+        logger.debug("persist_local_index_entry failed for %s: %s", local_path, e)
+
+
+def update_local_index_entries(
+    cache_dir: Path,
+    added: list[Path] | None = None,
+    removed: list[Path] | None = None,
+) -> bool:
+    """Update local index with specific file changes.
+
+    Efficiently updates the cache with only the files that changed,
+    rather than doing a full filesystem rescan.
+
+    Args:
+        cache_dir: Cache directory for SQLite backend.
+        added: List of file paths that were added.
+        removed: List of file paths that were removed.
+
+    Returns:
+        True if the index was updated successfully, False otherwise.
+    """
+    try:
+        cache = Cache(cache_dir, backend="sqlite")
+        current = cache.get("local_index") or {}
+        if not isinstance(current, dict):
+            current = {}
+
+        if removed:
+            for p in removed:
+                key = p.name
+                if key in current:
+                    del current[key]
+
+        if added:
+            for p in added:
+                if p.exists():
+                    current[p.name] = str(p)
+
+        cache.set("local_index", current)
+        logger.debug(
+            "Updated local index: +%d added, -%d removed",
+            len(added or []),
+            len(removed or []),
+        )
+        return True
+    except (
+        OSError,
+        PermissionError,
+        AttributeError,
+        KeyError,
+        TypeError,
+        sqlite3.Error,
+    ) as e:
+        logger.warning("Failed to update local index entries: %s", e)
+        return False
+
+
 def load_local_index(
     cache_file: Path,
     local_root: Path,
@@ -268,7 +604,7 @@ def organize_files_by_month(
         for filepath in filepath_list:
             # Extract epoch from filename
             epoch = extract_epoch_from_name(filename)
-            if not epoch:
+            if epoch is None:
                 logger.debug("No epoch found in filename: %s", filename)
                 continue
 
@@ -330,7 +666,7 @@ def get_target_path(
         if no epoch can be extracted.
     """
     epoch = extract_epoch_from_name(filename)
-    if not epoch:
+    if epoch is None:
         return None
 
     dt = extract_date_from_epoch(epoch)

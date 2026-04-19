@@ -12,6 +12,7 @@ import tempfile
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from xml.etree import ElementTree as ET
 
 from .logging import get_logger
@@ -21,7 +22,7 @@ StrCollection = str | Sequence[str] | set[str]
 logger = get_logger(__name__)
 
 
-def parse_release_date(candidate) -> str | None:
+def parse_release_date(candidate, *, validate_epoch: bool = True) -> str | None:
     """Parse a date candidate into ISO format (YYYY-MM-DD).
 
     Attempts multiple parsing strategies in order:
@@ -31,6 +32,10 @@ def parse_release_date(candidate) -> str | None:
 
     Args:
         candidate: The date value to parse (string, number, or None).
+        validate_epoch: When True (default), only treat numeric values as
+            timestamps if they fall within a realistic epoch range
+            (1e9 < val < 2e12). When False, skip epoch range validation
+            and attempt timestamp conversion for any numeric value.
 
     Returns:
         ISO formatted date string (YYYY-MM-DD) or None if parsing fails.
@@ -38,15 +43,16 @@ def parse_release_date(candidate) -> str | None:
     if candidate is None:
         return None
 
-    # Try timestamp parsing (validate realistic epoch range)
+    # Try timestamp parsing
     try:
         val = float(candidate)
-        # Only treat as timestamp if in realistic epoch range (>1e9, <2e12)
-        if 1e9 < val < 2e12:
-            if val > 1e11:
-                val = val / 1000.0
-            dt = datetime.fromtimestamp(val, tz=UTC)
-            return dt.date().isoformat()
+        if validate_epoch and not (1e9 < val < 2e12):
+            # Only treat as timestamp if in realistic epoch range (>1e9, <2e12)
+            raise ValueError("Outside epoch range")
+        if val > 1e11:
+            val = val / 1000.0
+        dt = datetime.fromtimestamp(val, tz=UTC)
+        return dt.date().isoformat()
     except (ValueError, TypeError, OverflowError):
         pass
 
@@ -94,6 +100,10 @@ def build_movie_nfo(
     releasedate: str | None = None,
     collections: StrCollection | None = None,
     uniqueid: dict[str, str] | None = None,
+    *,
+    kick_suffix: bool = False,
+    kick_tag: bool = False,
+    validate_epoch: bool = True,
 ) -> str:
     """Build an NFO XML string from media metadata.
 
@@ -114,6 +124,8 @@ def build_movie_nfo(
         releasedate: Release date in ISO format (optional).
         collections: List of collection/set names (optional).
         uniqueid: Dictionary of unique IDs (e.g., {"imdb": "tt12345"}) (optional).
+        kick_suffix: If True, append `` (KICK)`` to the title (optional).
+        kick_tag: If True, add a ``Kick Vod`` genre tag (optional).
 
     Returns:
         XML string representation of the movie NFO.
@@ -132,14 +144,14 @@ def build_movie_nfo(
 
     # Parse release date if provided
     if releasedate:
-        parsed = parse_release_date(releasedate)
-        if parsed:
-            releasedate = parsed
+        parsed = parse_release_date(releasedate, validate_epoch=validate_epoch)
+        releasedate = parsed
 
-    # Add basic metadata fields
-    _add_text("title", title)
+    effective_title = f"{title} (KICK)" if kick_suffix else title
+
+    _add_text("title", effective_title)
     _add_text("originaltitle", original_title)
-    _add_text("sorttitle", original_title if original_title else title)
+    _add_text("sorttitle", original_title if original_title else effective_title)
     _add_text("year", year)
     _add_text("plot", plot)
     _add_text("runtime", runtime)
@@ -153,7 +165,7 @@ def build_movie_nfo(
     # Normalize and filter entries first, sort sets for determinism
     collection_entries: list[str] = []
     if collections:
-        if isinstance(collections, (list, tuple, set)):
+        if isinstance(collections, list | tuple | set):
             items = collections
         else:
             items = [collections]
@@ -181,7 +193,7 @@ def build_movie_nfo(
             actor_list = sorted(actors)
         else:
             actor_list = actors
-        if not isinstance(actor_list, (list, tuple)):
+        if not isinstance(actor_list, list | tuple):
             actor_list = [actor_list]
         for actor_name in actor_list:
             if not actor_name:
@@ -197,15 +209,15 @@ def build_movie_nfo(
             name_el = ET.SubElement(actor_el, "name")
             name_el.text = name
 
+    seen_genres: set[str] = set()
     if genres:
-        seen_genres = set()
         if isinstance(genres, str):
             genre_list = [genres]
         elif isinstance(genres, set):
             genre_list = sorted(genres)
         else:
             genre_list = genres
-        if not isinstance(genre_list, (list, tuple)):
+        if not isinstance(genre_list, list | tuple):
             genre_list = [genre_list]
         for genre_name in genre_list:
             if not genre_name:
@@ -220,6 +232,12 @@ def build_movie_nfo(
                 seen_genres.add(key)
                 _add_text("genre", name)
 
+    if kick_tag:
+        kick_key = "kick vod"
+        if kick_key not in seen_genres:
+            seen_genres.add(kick_key)
+            _add_text("genre", "Kick Vod")
+
     # Add unique IDs
     if uniqueid:
         for id_type, id_value in uniqueid.items():
@@ -230,6 +248,56 @@ def build_movie_nfo(
                 uid_el.text = str(id_value)
 
     return ET.tostring(movie, encoding="unicode")
+
+
+def generate_nfo(
+    meta: dict[str, Any],
+    *,
+    validate_epoch: bool = True,
+    kick_suffix: bool = False,
+    kick_tag: bool = False,
+) -> str:
+    """Generate an NFO XML string from a metadata dictionary.
+
+    A dict-based convenience wrapper around :func:`build_movie_nfo` that
+    extracts known keys from *meta* and passes them as keyword arguments.
+    This matches the calling convention used by downstream consumers that
+    work with raw metadata dicts.
+
+    The *releasedate* value is parsed through :func:`parse_release_date`
+    with the given *validate_epoch* setting before being forwarded.
+
+    Args:
+        meta: Dictionary containing media metadata. Recognised keys:
+            ``title``, ``originaltitle``, ``year``, ``plot``, ``director``,
+            ``actors``, ``genres``, ``runtime``, ``rating``, ``releasedate``,
+            ``collections``, ``uniqueid``.
+        validate_epoch: Forwarded to :func:`parse_release_date`.
+        kick_suffix: Forwarded to :func:`build_movie_nfo`.
+        kick_tag: Forwarded to :func:`build_movie_nfo`.
+
+    Returns:
+        XML string representation of the movie NFO.
+    """
+    releasedate = meta.get("releasedate")
+
+    return build_movie_nfo(
+        title=meta.get("title", ""),
+        year=meta.get("year"),
+        plot=meta.get("plot"),
+        director=meta.get("director"),
+        actors=meta.get("actors"),
+        genres=meta.get("genres") if "genres" in meta else meta.get("tags"),
+        runtime=meta.get("runtime"),
+        rating=meta.get("rating"),
+        original_title=meta.get("originaltitle"),
+        releasedate=releasedate,
+        collections=meta.get("collections"),
+        uniqueid=meta.get("uniqueid"),
+        kick_suffix=kick_suffix,
+        kick_tag=kick_tag,
+        validate_epoch=validate_epoch,
+    )
 
 
 def write_nfo_for_path(
