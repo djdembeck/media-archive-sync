@@ -394,10 +394,12 @@ def find_missing_to_append(
     """
     if match_by == "name":
         existing = {n for _, n in (cached_media or [])}
+        seen = set(existing)
         to_append: list[tuple[str, str]] = []
         for full, dec in month_items or []:
-            if dec not in existing:
+            if dec not in seen:
                 to_append.append((full, dec))
+                seen.add(dec)
         return to_append
     elif match_by == "tuple":
         existing = set(cached_media or [])
@@ -436,7 +438,7 @@ def is_file_too_old_for_download(
         bool: True if the file should be skipped because it exceeds
             max_age_days, False otherwise.
     """
-    if fail_closed and max_age_days is None and not allow_old_downloads:
+    if fail_closed and max_age_days in (None, 0) and not allow_old_downloads:
         return True
 
     if allow_old_downloads:

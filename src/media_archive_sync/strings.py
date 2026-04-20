@@ -64,10 +64,12 @@ def normalise_string(
         return ""
 
     if video_extensions is not None:
+        # Normalize extensions: strip leading dots and lowercase
+        normalized_exts = {ext.lstrip(".").lower() for ext in video_extensions}
         # Explicit set: only strip known extensions
         if "." in s:
             ext = s.rsplit(".", 1)[1].lower()
-            if ext in video_extensions:
+            if ext in normalized_exts:
                 s = s.rsplit(".", 1)[0]
     else:
         if "." in s:

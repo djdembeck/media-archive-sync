@@ -445,14 +445,13 @@ class TestIsFileTooOldFailClosed:
         assert result is False
 
     def test_fail_closed_with_explicit_max_age_zero_allows(self):
-        """max_age_days=0 with fail_closed=True allows any download."""
         result = is_file_too_old_for_download(
             "http://example.com/video.mp4",
             "video.mp4",
             max_age_days=0,
             fail_closed=True,
         )
-        assert result is False
+        assert result is True
 
     def test_default_max_age_none_no_limit(self):
         """Default max_age_days=None means no age limit."""

@@ -124,17 +124,23 @@ def resolve_override_key(
                 return c
 
         n_norm = normalise_string(name)
+        n_decoded_norm = normalise_string(urllib.parse.unquote(name))
+        n_basename_norm = normalise_string(os.path.basename(name))
         for k in local_overrides:
             try:
                 k_norm = normalise_string(k)
-                if k_norm == n_norm:
-                    if isinstance(k, str):
-                        return k
-                    return str(k)
-                if len(k_norm) >= 4 and (k_norm in n_norm or n_norm in k_norm):
-                    if isinstance(k, str):
-                        return k
-                    return str(k)
+                for target in [n_norm, n_decoded_norm, n_basename_norm]:
+                    if k_norm == target:
+                        return k if isinstance(k, str) else str(k)
+                for n_target, k_target in [
+                    (n_norm, k_norm),
+                    (n_decoded_norm, k_norm),
+                    (n_basename_norm, k_norm),
+                ]:
+                    if len(k_target) >= 4 and (
+                        k_target in n_target or n_target in k_target
+                    ):
+                        return k if isinstance(k, str) else str(k)
             except (TypeError, ValueError) as e:
                 logger.debug(
                     "resolve_override_key: normalization failed for key '%s': %s",
@@ -346,13 +352,30 @@ def load_local_files_single(
                         cleaned = re.sub(r"\s+", " ", p.name).replace("\n", " ").strip()
                         if cleaned and cleaned != p.name:
                             if cleaned in mapping and mapping[cleaned] != p:
-                                logger.debug(
-                                    "Cleaned-name collision: %r maps to %s, overwriting %s",
-                                    cleaned,
-                                    p,
-                                    mapping[cleaned],
-                                )
-                            mapping[cleaned] = p
+                                # Compare mtime: keep the one with newer modification time
+                                try:
+                                    existing_path = mapping[cleaned]
+                                    current_mtime = p.stat().st_mtime
+                                    existing_mtime = existing_path.stat().st_mtime
+                                    if current_mtime > existing_mtime:
+                                        logger.debug(
+                                            "Cleaned-name collision: %r maps to %s, overwriting %s (newer mtime)",
+                                            cleaned,
+                                            p,
+                                            mapping[cleaned],
+                                        )
+                                        mapping[cleaned] = p
+                                    else:
+                                        logger.debug(
+                                            "Cleaned-name collision: %r maps to %s, keeping %s (newer mtime)",
+                                            cleaned,
+                                            mapping[cleaned],
+                                            p,
+                                        )
+                                except (OSError, PermissionError):
+                                    mapping[cleaned] = p
+                            else:
+                                mapping[cleaned] = p
                     except (re.error, ValueError):
                         pass
 
