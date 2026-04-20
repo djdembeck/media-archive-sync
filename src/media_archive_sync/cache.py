@@ -14,7 +14,7 @@ import os
 import sqlite3
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -458,3 +458,260 @@ def delete_key(cache_dir: Path | str, key: str) -> None:
 # Backward compatibility aliases
 get_json = get_cached
 set_json = set_cached
+
+
+# ---------------------------------------------------------------------------
+# Media-index specific cache functions
+# ---------------------------------------------------------------------------
+
+_MEDIA_INDEX_KEY = "media_index"
+_MEDIA_INDEX_JSON = "media_index.json"
+
+
+class MediaIndexResult(NamedTuple):
+    """Result of loading media index from cache."""
+
+    media_list: list[tuple[str, str]]
+    dir_counts: dict[str, int]
+    local_overrides: dict[str, str]
+    loaded: bool
+    has_data: bool
+
+
+def _parse_media_list(raw: Any) -> list[tuple[str, str]]:
+    """Parse raw media list data into typed list of (path, title) tuples.
+
+    Validates that each element is a tuple/list with at least 2 string elements.
+
+    Args:
+        raw: Raw data from cache (expected to be list or tuple).
+
+    Returns:
+        List of (path, title) tuples with both elements as str.
+    """
+    if not isinstance(raw, list | tuple):
+        return []
+    result: list[tuple[str, str]] = []
+    for item in raw:
+        if isinstance(item, list | tuple) and len(item) >= 2:
+            p0, p1 = item[0], item[1]
+            if isinstance(p0, str) and isinstance(p1, str):
+                result.append((p0, p1))
+    return result
+
+
+def _parse_dict_counts(raw: Any) -> dict[str, int]:
+    """Parse raw directory counts into typed dictionary.
+
+    Validates that keys are strings and values are non-negative integers.
+    Only accepts int >= 0 or float values that are integral (v.is_integer())
+    and >= 0. Explicitly excludes bool and str values.
+
+    Args:
+        raw: Raw data from cache (expected to be dict).
+
+    Returns:
+        Dictionary mapping str directory paths to int file counts.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, int] = {}
+    for k, v in raw.items():
+        if not isinstance(k, str):
+            continue
+        if type(v) is int and v >= 0:
+            result[k] = v
+        elif type(v) is float and v.is_integer() and v >= 0:
+            result[k] = int(v)
+    return result
+
+
+def _parse_local_overrides(raw: Any) -> dict[str, str]:
+    """Parse raw local overrides into typed dictionary.
+
+    Validates that both keys and values are strings (or convertible to str).
+
+    Args:
+        raw: Raw data from cache (expected to be dict).
+
+    Returns:
+        Dictionary mapping str server basenames to str local paths.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, str] = {}
+    for k, v in raw.items():
+        if isinstance(k, str) and (
+            isinstance(v, str) or (type(v) is int) or (type(v) is float)
+        ):
+            result[k] = str(v)
+    return result
+
+
+def load_media_index(
+    cache_dir: Path | str,
+    *,
+    json_filename: str = _MEDIA_INDEX_JSON,
+) -> MediaIndexResult:
+    """Load media index from SQLite cache with JSON file fallback.
+
+    Attempts to load from SQLite first. If SQLite has no data or returns
+    an invalid type, falls back to the JSON file. When JSON data is loaded
+    and contains entries, it is migrated to SQLite for future lookups.
+
+    Args:
+        cache_dir: Directory where cache files are stored.
+        json_filename: Name of the JSON fallback file (default: media_index.json).
+
+    Returns:
+        MediaIndexResult containing:
+            - media_list: List of (path, title) tuples for remote media files.
+            - dir_counts: Dictionary mapping directory paths to file counts.
+            - local_overrides: Dictionary of filename overrides.
+            - loaded: Whether the load operation succeeded (data was read).
+            - has_data: Whether any collection actually contains items.
+    """
+    cache_dir = Path(cache_dir)
+
+    # --- Try SQLite first ---
+    try:
+        cache = Cache(cache_dir, backend="sqlite")
+        data = cache.get(_MEDIA_INDEX_KEY)
+        if data is not None:
+            if not isinstance(data, dict):
+                logger.debug(
+                    "Invalid cache data type in SQLite: %s", type(data).__name__
+                )
+                with contextlib.suppress(Exception):
+                    cache.delete(_MEDIA_INDEX_KEY)
+            else:
+                media_list = _parse_media_list(data.get("media_list", []))
+                dir_counts = _parse_dict_counts(data.get("dir_counts", {}))
+                local_overrides = _parse_local_overrides(
+                    data.get("local_overrides", {})
+                )
+                has_data = bool(media_list or dir_counts or local_overrides)
+                return MediaIndexResult(
+                    media_list, dir_counts, local_overrides, True, has_data
+                )
+    except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
+        logger.debug("Failed to load media index from SQLite: %s", exc)
+
+    # --- Fallback to JSON file ---
+    json_path = cache_dir / json_filename
+    try:
+        if json_path.is_file():
+            with json_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return MediaIndexResult([], {}, {}, False, False)
+            media_list = _parse_media_list(data.get("media_list", []))
+            dir_counts = _parse_dict_counts(data.get("dir_counts", {}))
+            local_overrides = _parse_local_overrides(data.get("local_overrides", {}))
+            has_data = bool(media_list or dir_counts or local_overrides)
+
+            # Migrate to SQLite for future lookups
+            if has_data:
+                try:
+                    cache = Cache(cache_dir, backend="sqlite")
+                    cache.set(
+                        _MEDIA_INDEX_KEY,
+                        {
+                            "media_list": media_list,
+                            "dir_counts": dir_counts,
+                            "local_overrides": local_overrides,
+                        },
+                    )
+                except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
+                    logger.debug(
+                        "Failed to migrate JSON media index to SQLite: %s", exc
+                    )
+
+            return MediaIndexResult(
+                media_list, dir_counts, local_overrides, True, has_data
+            )
+    except (OSError, json.JSONDecodeError, ValueError, TypeError, sqlite3.Error) as exc:
+        logger.debug("Failed to load media index from JSON: %s", exc)
+
+    return MediaIndexResult([], {}, {}, False, False)
+
+
+def save_media_index(
+    media_list: list[tuple[str, str]],
+    dir_counts: dict[str, int],
+    local_overrides: dict[str, str],
+    cache_dir: Path | str,
+    *,
+    json_filename: str = _MEDIA_INDEX_JSON,
+    write_json: bool = False,
+) -> None:
+    """Save media index to SQLite cache and optionally to JSON file.
+
+    Args:
+        media_list: List of (path, title) tuples for remote media files.
+        dir_counts: Dictionary mapping directory paths to file counts.
+        local_overrides: Dictionary of filename overrides.
+        cache_dir: Directory where cache files are stored.
+        json_filename: Name of the JSON file (default: media_index.json).
+        write_json: If True, also write a JSON backup file.
+
+    Returns:
+        None
+    """
+    cache_dir = Path(cache_dir)
+    payload = {
+        "media_list": media_list,
+        "dir_counts": dir_counts,
+        "local_overrides": local_overrides,
+    }
+
+    try:
+        cache = Cache(cache_dir, backend="sqlite")
+        cache.set(_MEDIA_INDEX_KEY, payload)
+        logger.info("Saved media index cache: %d entries", len(media_list))
+    except (OSError, ValueError, TypeError, sqlite3.Error) as exc:
+        logger.warning("Failed to save media index to SQLite: %s", exc)
+
+    if write_json:
+        try:
+            json_path = cache_dir / json_filename
+            json_path.parent.mkdir(parents=True, exist_ok=True)
+            import tempfile as _tf
+
+            fd, tmp_name = _tf.mkstemp(
+                suffix=".tmp", prefix=json_path.stem + "_", dir=json_path.parent
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2, ensure_ascii=False)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_name, json_path)
+            except Exception:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_name)
+                raise
+        except (OSError, TypeError, ValueError, sqlite3.Error) as exc:
+            logger.debug("Failed to write JSON media index file: %s", exc)
+
+
+def merge_overrides(
+    existing: dict[str, str] | None,
+    new: dict[str, str],
+) -> dict[str, str]:
+    """Merge new overrides into existing overrides dictionary.
+
+    Creates a new dictionary containing all entries from the existing overrides
+    (if any) updated with entries from the new overrides. Values in the new
+    dictionary take precedence over existing values for duplicate keys.
+
+    Args:
+        existing: Existing overrides dictionary, or None if no previous overrides.
+        new: New overrides to merge, with values taking precedence.
+
+    Returns:
+        Dictionary containing merged overrides (existing values + new values).
+    """
+    merged = dict(existing or {})
+    merged.update(new)
+    return merged
