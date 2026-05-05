@@ -18,6 +18,7 @@ from xml.etree import ElementTree as ET
 from .logging import get_logger
 
 StrCollection = str | Sequence[str] | set[str]
+ActorsSpec = str | Sequence[str] | set[str] | Sequence[dict[str, Any]]
 
 logger = get_logger(__name__)
 
@@ -92,7 +93,7 @@ def build_movie_nfo(
     year: int | None = None,
     plot: str | None = None,
     director: str | None = None,
-    actors: StrCollection | None = None,
+    actors: ActorsSpec | None = None,
     genres: StrCollection | None = None,
     runtime: int | None = None,
     rating: float | None = None,
@@ -100,6 +101,9 @@ def build_movie_nfo(
     releasedate: str | None = None,
     collections: StrCollection | None = None,
     uniqueid: dict[str, str] | None = None,
+    tags: StrCollection | None = None,
+    ratings: list[dict[str, Any]] | None = None,
+    parasocial_key: str | None = None,
     *,
     kick_suffix: bool = False,
     kick_tag: bool = False,
@@ -109,23 +113,26 @@ def build_movie_nfo(
 
     Constructs a Kodi-compatible movie NFO XML document with title,
     original title, sort title, year, rating, release date, collections,
-    genres, actors, and director information.
+    genres, actors, tags, ratings, and director information.
 
     Args:
         title: The main title of the movie/video.
         year: Release year (optional).
         plot: Plot/summary text (optional).
         director: Director name (optional).
-        actors: List of actor names (optional).
-        genres: List of genre/tag names (optional).
+        actors: List of actor names or dicts with keys: name, role, order, thumb (optional).
+        genres: List of genre names (optional).
         runtime: Runtime in minutes (optional).
-        rating: Rating value (optional).
+        rating: Rating value (optional, backward compat - use ratings for new code).
         original_title: Original title (e.g., non-English) (optional).
-        releasedate: Release date in ISO format (optional).
-        collections: List of collection/set names (optional).
+        releasedate: Release date in ISO format (optional, emits <premiered> XML element).
+        collections: List of collection/set names (optional, emits <set><name> elements).
         uniqueid: Dictionary of unique IDs (e.g., {"imdb": "tt12345"}) (optional).
+        tags: List of tag names (optional, emits <tag> elements).
+        ratings: List of rating dicts with keys: name, max, value, votes, default (optional).
+        parasocial_key: Parasocial unique ID (optional, emits <uniqueid type="parasocial">).
         kick_suffix: If True, append `` (KICK)`` to the title (optional).
-        kick_tag: If True, add a ``Kick Vod`` genre tag (optional).
+        kick_tag: If True, add a ``Kick Vod`` tag (optional).
 
     Returns:
         XML string representation of the movie NFO.
@@ -155,14 +162,12 @@ def build_movie_nfo(
     _add_text("year", year)
     _add_text("plot", plot)
     _add_text("runtime", runtime)
-    _add_text("rating", rating)
-    _add_text("releasedate", releasedate)
+    _add_text("premiered", releasedate)
 
     # Add director
     _add_text("director", director)
 
-    # Add collections/sets
-    # Normalize and filter entries first, sort sets for determinism
+    # Add collections/sets (emits <set><name> directly under <movie>, no wrapper)
     collection_entries: list[str] = []
     if collections:
         if isinstance(collections, list | tuple | set):
@@ -178,12 +183,10 @@ def build_movie_nfo(
         # Sort if original was a set to ensure deterministic order
         if isinstance(collections, set):
             collection_entries = sorted(collection_entries)
-    # Only create wrapper element if there are valid entries
-    if collection_entries:
-        c_el = ET.SubElement(movie, "collections")
-        for ss in collection_entries:
-            set_el = ET.SubElement(c_el, "set")
-            set_el.text = ss
+    for ss in collection_entries:
+        set_el = ET.SubElement(movie, "set")
+        name_el = ET.SubElement(set_el, "name")
+        name_el.text = ss
 
     if actors:
         seen_actors = set()
@@ -195,20 +198,48 @@ def build_movie_nfo(
             actor_list = actors
         if not isinstance(actor_list, list | tuple):
             actor_list = [actor_list]
-        for actor_name in actor_list:
-            if not actor_name:
+        for actor_item in actor_list:
+            if not actor_item:
                 continue
-            name = str(actor_name).strip()
-            if not name:
-                continue
-            key = name.lower()
-            if key in seen_actors:
-                continue
-            seen_actors.add(key)
-            actor_el = ET.SubElement(movie, "actor")
-            name_el = ET.SubElement(actor_el, "name")
-            name_el.text = name
+            # Handle dict actors with name, role, order, thumb keys
+            if isinstance(actor_item, dict):
+                actor_name = actor_item.get("name")
+                if not actor_name:
+                    continue
+                name = str(actor_name).strip()
+                if not name:
+                    continue
+                key = name.lower()
+                if key in seen_actors:
+                    continue
+                seen_actors.add(key)
+                actor_el = ET.SubElement(movie, "actor")
+                name_el = ET.SubElement(actor_el, "name")
+                name_el.text = name
+                # Add optional subelements only if present
+                if "role" in actor_item and actor_item["role"]:
+                    role_el = ET.SubElement(actor_el, "role")
+                    role_el.text = str(actor_item["role"]).strip()
+                if "order" in actor_item and actor_item["order"] is not None:
+                    order_el = ET.SubElement(actor_el, "order")
+                    order_el.text = str(actor_item["order"])
+                if "thumb" in actor_item and actor_item["thumb"]:
+                    thumb_el = ET.SubElement(actor_el, "thumb")
+                    thumb_el.text = str(actor_item["thumb"]).strip()
+            else:
+                # String actor
+                name = str(actor_item).strip()
+                if not name:
+                    continue
+                key = name.lower()
+                if key in seen_actors:
+                    continue
+                seen_actors.add(key)
+                actor_el = ET.SubElement(movie, "actor")
+                name_el = ET.SubElement(actor_el, "name")
+                name_el.text = name
 
+    # Add genres
     seen_genres: set[str] = set()
     if genres:
         if isinstance(genres, str):
@@ -232,11 +263,60 @@ def build_movie_nfo(
                 seen_genres.add(key)
                 _add_text("genre", name)
 
+    # Add tags (separate from genres)
+    seen_tags: set[str] = set()
+    if tags:
+        if isinstance(tags, str):
+            tag_list = [tags]
+        elif isinstance(tags, set):
+            tag_list = sorted(tags)
+        else:
+            tag_list = tags
+        if not isinstance(tag_list, list | tuple):
+            tag_list = [tag_list]
+        for tag_name in tag_list:
+            if not tag_name:
+                continue
+            name = str(tag_name).strip()
+            if not name:
+                continue
+            with contextlib.suppress(ValueError):
+                name = html.unescape(name)
+            key = name.lower()
+            if key not in seen_tags:
+                seen_tags.add(key)
+                _add_text("tag", name)
+
     if kick_tag:
         kick_key = "kick vod"
-        if kick_key not in seen_genres:
-            seen_genres.add(kick_key)
-            _add_text("genre", "Kick Vod")
+        if kick_key not in seen_tags:
+            seen_tags.add(kick_key)
+            _add_text("tag", "Kick Vod")
+
+    # Add ratings (new structure with <ratings> wrapper)
+    if ratings:
+        ratings_el = ET.SubElement(movie, "ratings")
+        for rating_dict in ratings:
+            if not isinstance(rating_dict, dict):
+                continue
+            rating_name = rating_dict.get("name", "")
+            if not rating_name:
+                continue
+            rating_entry_el = ET.SubElement(ratings_el, "rating")
+            rating_entry_el.set("name", str(rating_name))
+            if "max" in rating_dict and rating_dict["max"] is not None:
+                rating_entry_el.set("max", str(rating_dict["max"]))
+            if "default" in rating_dict and rating_dict["default"]:
+                rating_entry_el.set("default", "true")
+            if "value" in rating_dict and rating_dict["value"] is not None:
+                value_el = ET.SubElement(rating_entry_el, "value")
+                value_el.text = str(rating_dict["value"])
+            if "votes" in rating_dict and rating_dict["votes"] is not None:
+                votes_el = ET.SubElement(rating_entry_el, "votes")
+                votes_el.text = str(rating_dict["votes"])
+    elif rating is not None:
+        # Backward compat: flat <rating> element
+        _add_text("rating", rating)
 
     # Add unique IDs
     if uniqueid:
@@ -246,6 +326,18 @@ def build_movie_nfo(
                 uid_el.set("type", id_type)
                 uid_el.set("default", "true" if id_type == "imdb" else "false")
                 uid_el.text = str(id_value)
+
+    # Add parasocial_key as uniqueid
+    if parasocial_key:
+        uid_el = ET.SubElement(movie, "uniqueid")
+        uid_el.set("type", "parasocial")
+        # Only set default="true" if no other uniqueid has default="true"
+        has_default = any(
+            uniqueid and uniqueid.get(k) and k == "imdb" for k in (uniqueid or {})
+        )
+        if not has_default:
+            uid_el.set("default", "true")
+        uid_el.text = str(parasocial_key)
 
     return ET.tostring(movie, encoding="unicode")
 
@@ -270,8 +362,9 @@ def generate_nfo(
     Args:
         meta: Dictionary containing media metadata. Recognised keys:
             ``title``, ``originaltitle``, ``year``, ``plot``, ``director``,
-            ``actors``, ``genres``, ``runtime``, ``rating``, ``releasedate``,
-            ``collections``, ``uniqueid``.
+            ``actors``, ``genres``, ``tags``, ``runtime``, ``rating``,
+            ``ratings``, ``releasedate``, ``collections``, ``uniqueid``,
+            ``parasocial_key``.
         validate_epoch: Forwarded to :func:`parse_release_date`.
         kick_suffix: Forwarded to :func:`build_movie_nfo`.
         kick_tag: Forwarded to :func:`build_movie_nfo`.
@@ -281,19 +374,31 @@ def generate_nfo(
     """
     releasedate = meta.get("releasedate")
 
+    # Handle genres and tags separately if both present
+    genres = meta.get("genres")
+    tags = meta.get("tags")
+
+    # Backward compat: if only "tags" is present and no "genres", map tags to genres
+    if tags is not None and genres is None:
+        genres = tags
+        tags = None
+
     return build_movie_nfo(
         title=meta.get("title", ""),
         year=meta.get("year"),
         plot=meta.get("plot"),
         director=meta.get("director"),
         actors=meta.get("actors"),
-        genres=meta.get("genres") if "genres" in meta else meta.get("tags"),
+        genres=genres,
+        tags=tags,
         runtime=meta.get("runtime"),
         rating=meta.get("rating"),
+        ratings=meta.get("ratings"),
         original_title=meta.get("originaltitle"),
         releasedate=releasedate,
         collections=meta.get("collections"),
         uniqueid=meta.get("uniqueid"),
+        parasocial_key=meta.get("parasocial_key"),
         kick_suffix=kick_suffix,
         kick_tag=kick_tag,
         validate_epoch=validate_epoch,

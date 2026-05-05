@@ -64,44 +64,40 @@ class TestBuildMovieNfo:
         assert title.text == "Test Movie"
 
     def test_collections_as_list(self):
-        """Test collections as list are handled."""
+        """Test collections as list emit <set><name> elements."""
         xml = build_movie_nfo(
             title="Test Movie", collections=["Collection 1", "Collection 2"]
         )
         root = ET.fromstring(xml)
 
-        collections = root.find("collections")
-        assert collections is not None
-        sets = collections.findall("set")
+        sets = root.findall("set")
         assert len(sets) == 2
+        names = [s.find("name").text for s in sets]
+        assert names == ["Collection 1", "Collection 2"]
 
     def test_collections_as_tuple(self):
-        """Test collections as tuple are handled."""
+        """Test collections as tuple emit <set><name> elements."""
         xml = build_movie_nfo(title="Test Movie", collections=("Coll1", "Coll2"))
         root = ET.fromstring(xml)
 
-        collections = root.find("collections")
-        assert collections is not None
+        sets = root.findall("set")
+        assert len(sets) == 2
 
     def test_collections_as_set(self):
-        """Test collections as set are handled."""
+        """Test collections as set emit <set><name> elements."""
         xml = build_movie_nfo(title="Test Movie", collections={"Set Collection"})
         root = ET.fromstring(xml)
 
-        collections = root.find("collections")
-        assert collections is not None
-        sets = collections.findall("set")
+        sets = root.findall("set")
         assert len(sets) == 1
-        assert sets[0].text == "Set Collection"
+        assert sets[0].find("name").text == "Set Collection"
 
     def test_collections_as_string(self):
-        """Test collections as string are handled."""
+        """Test collections as string emit <set><name> element."""
         xml = build_movie_nfo(title="Test Movie", collections="Single Collection")
         root = ET.fromstring(xml)
 
-        collections = root.find("collections")
-        assert collections is not None
-        sets = collections.findall("set")
+        sets = root.findall("set")
         assert len(sets) == 1
 
     def test_actors_as_list(self):
@@ -196,26 +192,23 @@ class TestBuildMovieNfoCollectionsFiltering:
     """Tests for collections filtering and sorting."""
 
     def test_collections_empty_after_filtering_no_wrapper(self):
-        """Test that empty collections don't create wrapper element."""
+        """Test that empty collections are filtered, valid ones remain as <set>."""
         xml = build_movie_nfo(
             title="Test Movie", collections=["", "   ", None, "Valid"]
         )
         root = ET.fromstring(xml)
 
-        collections = root.find("collections")
-        # Wrapper should still exist because we have one valid entry
-        assert collections is not None
-        sets = collections.findall("set")
+        sets = root.findall("set")
         assert len(sets) == 1
-        assert sets[0].text == "Valid"
+        assert sets[0].find("name").text == "Valid"
 
     def test_collections_all_empty_no_wrapper(self):
-        """Test that all-empty collections don't create wrapper."""
+        """Test that all-empty collections don't create any <set> elements."""
         xml = build_movie_nfo(title="Test Movie", collections=["", "   ", None])
         root = ET.fromstring(xml)
 
-        collections = root.find("collections")
-        assert collections is None
+        sets = root.findall("set")
+        assert len(sets) == 0
 
     def test_collections_set_sorted_deterministically(self):
         """Test that set collections are sorted for deterministic output."""
@@ -224,10 +217,8 @@ class TestBuildMovieNfoCollectionsFiltering:
         )
         root = ET.fromstring(xml)
 
-        collections = root.find("collections")
-        assert collections is not None
-        sets = collections.findall("set")
-        texts = [s.text for s in sets]
+        sets = root.findall("set")
+        texts = [s.find("name").text for s in sets]
         # Should be sorted alphabetically
         assert texts == ["Alpha", "Mike", "Zebra"]
 
@@ -238,10 +229,8 @@ class TestBuildMovieNfoCollectionsFiltering:
         )
         root = ET.fromstring(xml)
 
-        collections = root.find("collections")
-        assert collections is not None
-        sets = collections.findall("set")
-        texts = [s.text for s in sets]
+        sets = root.findall("set")
+        texts = [s.find("name").text for s in sets]
         # Should maintain original order
         assert texts == ["Zebra", "Alpha", "Mike"]
 
@@ -250,19 +239,17 @@ class TestBuildMovieNfoCollectionsFiltering:
         xml = build_movie_nfo(title="Test Movie", collections="Single Collection")
         root = ET.fromstring(xml)
 
-        collections = root.find("collections")
-        assert collections is not None
-        sets = collections.findall("set")
+        sets = root.findall("set")
         assert len(sets) == 1
-        assert sets[0].text == "Single Collection"
+        assert sets[0].find("name").text == "Single Collection"
 
     def test_collections_single_string_empty_no_wrapper(self):
-        """Test that empty string collection doesn't create wrapper."""
+        """Test that empty string collection doesn't create <set> element."""
         xml = build_movie_nfo(title="Test Movie", collections="   ")
         root = ET.fromstring(xml)
 
-        collections = root.find("collections")
-        assert collections is None
+        sets = root.findall("set")
+        assert len(sets) == 0
 
 
 class TestParseReleaseDateValidateEpoch:
@@ -371,29 +358,29 @@ class TestBuildMovieNfoKickOptions:
         assert sorttitle is not None
         assert sorttitle.text == "Original"
 
-    def test_kick_tag_adds_genre(self):
-        """kick_tag=True adds 'Kick Vod' genre."""
+    def test_kick_tag_adds_tag(self):
+        """kick_tag=True adds 'Kick Vod' tag."""
         xml = build_movie_nfo(title="My Stream", kick_tag=True)
         root = ET.fromstring(xml)
-        genres = [g.text for g in root.findall("genre")]
-        assert "Kick Vod" in genres
+        tags = [t.text for t in root.findall("tag")]
+        assert "Kick Vod" in tags
 
-    def test_kick_tag_false_no_genre(self):
-        """kick_tag=False does not add Kick Vod genre."""
+    def test_kick_tag_false_no_tag(self):
+        """kick_tag=False does not add Kick Vod tag."""
         xml = build_movie_nfo(title="My Stream", kick_tag=False)
         root = ET.fromstring(xml)
-        genres = [g.text for g in root.findall("genre")]
-        assert "Kick Vod" not in genres
+        tags = [t.text for t in root.findall("tag")]
+        assert "Kick Vod" not in tags
 
     def test_kick_tag_default_false(self):
         """Default kick_tag is False (backward compatibility)."""
         xml = build_movie_nfo(title="My Stream")
         root = ET.fromstring(xml)
-        genres = [g.text for g in root.findall("genre")]
-        assert "Kick Vod" not in genres
+        tags = [t.text for t in root.findall("tag")]
+        assert "Kick Vod" not in tags
 
     def test_kick_tag_with_existing_genres(self):
-        """kick_tag=True adds Kick Vod alongside existing genres."""
+        """kick_tag=True adds Kick Vod tag alongside existing genres."""
         xml = build_movie_nfo(
             title="My Stream", genres=["Action", "Drama"], kick_tag=True
         )
@@ -401,7 +388,8 @@ class TestBuildMovieNfoKickOptions:
         genres = [g.text for g in root.findall("genre")]
         assert "Action" in genres
         assert "Drama" in genres
-        assert "Kick Vod" in genres
+        tags = [t.text for t in root.findall("tag")]
+        assert "Kick Vod" in tags
 
     def test_kick_suffix_and_tag_combined(self):
         """Both kick_suffix and kick_tag can be used together."""
@@ -409,24 +397,188 @@ class TestBuildMovieNfoKickOptions:
         root = ET.fromstring(xml)
         title = root.find("title")
         assert title.text == "My Stream (KICK)"
-        genres = [g.text for g in root.findall("genre")]
-        assert "Kick Vod" in genres
+        tags = [t.text for t in root.findall("tag")]
+        assert "Kick Vod" in tags
 
-    def test_no_duplicate_kick_vod_genre(self):
-        """kick_tag=True should not add duplicate 'Kick Vod' genre."""
-        xml = build_movie_nfo(title="Test", genres=["Kick Vod"], kick_tag=True)
+    def test_no_duplicate_kick_vod_tag(self):
+        """kick_tag=True should not add duplicate 'Kick Vod' tag."""
+        xml = build_movie_nfo(title="Test", tags=["Kick Vod"], kick_tag=True)
         root = ET.fromstring(xml)
-        genres = [g.text for g in root.findall("genre")]
-        kick_vod_count = genres.count("Kick Vod")
+        tags = [t.text for t in root.findall("tag")]
+        kick_vod_count = tags.count("Kick Vod")
         assert kick_vod_count == 1
 
     def test_validate_epoch_forwarded_in_build_movie_nfo(self):
         """validate_epoch is forwarded to parse_release_date in build_movie_nfo."""
         xml = build_movie_nfo(title="Test", releasedate="100", validate_epoch=False)
         root = ET.fromstring(xml)
-        rd = root.find("releasedate")
+        rd = root.find("premiered")
         assert rd is not None
         assert rd.text == "1970-01-01"
+
+
+class TestBuildMovieNfoTags:
+    """Tests for build_movie_nfo tags parameter."""
+
+    def test_tags_as_list(self):
+        """tags as list emit <tag> elements."""
+        xml = build_movie_nfo(title="T", tags=["twitch vod", "kick vod"])
+        root = ET.fromstring(xml)
+        tags = [t.text for t in root.findall("tag")]
+        assert "twitch vod" in tags
+        assert "kick vod" in tags
+
+    def test_tags_as_set(self):
+        """tags as set emit <tag> elements."""
+        xml = build_movie_nfo(title="T", tags={"twitch vod", "kick vod"})
+        root = ET.fromstring(xml)
+        tags = [t.text for t in root.findall("tag")]
+        assert "twitch vod" in tags
+        assert "kick vod" in tags
+
+    def test_tags_and_genres_separate(self):
+        """Both <genre> and <tag> elements present when both params given."""
+        xml = build_movie_nfo(title="T", genres=["Action"], tags=["twitch vod"])
+        root = ET.fromstring(xml)
+        genres = [g.text for g in root.findall("genre")]
+        tags = [t.text for t in root.findall("tag")]
+        assert "Action" in genres
+        assert "twitch vod" in tags
+        # Ensure no cross-contamination
+        assert "twitch vod" not in genres
+        assert "Action" not in tags
+
+
+class TestBuildMovieNfoRatings:
+    """Tests for build_movie_nfo ratings parameter."""
+
+    def test_ratings_block(self):
+        """ratings list produces <ratings> block with <rating> entries."""
+        xml = build_movie_nfo(
+            title="T",
+            ratings=[{"name": "imdb", "max": 10, "value": 7.7, "default": True}],
+        )
+        root = ET.fromstring(xml)
+        ratings_el = root.find("ratings")
+        assert ratings_el is not None
+        rating_els = ratings_el.findall("rating")
+        assert len(rating_els) == 1
+        assert rating_els[0].get("name") == "imdb"
+        assert rating_els[0].get("max") == "10"
+        assert rating_els[0].get("default") == "true"
+        value_el = rating_els[0].find("value")
+        assert value_el is not None
+        assert value_el.text == "7.7"
+
+    def test_ratings_block_with_votes(self):
+        """ratings block includes votes subelement."""
+        xml = build_movie_nfo(
+            title="T",
+            ratings=[
+                {
+                    "name": "imdb",
+                    "max": 10,
+                    "value": 8.5,
+                    "votes": 12345,
+                    "default": True,
+                }
+            ],
+        )
+        root = ET.fromstring(xml)
+        ratings_el = root.find("ratings")
+        rating_el = ratings_el.find("rating")
+        votes_el = rating_el.find("votes")
+        assert votes_el is not None
+        assert votes_el.text == "12345"
+
+    def test_no_ratings_when_not_provided(self):
+        """No <ratings> element when ratings=None."""
+        xml = build_movie_nfo(title="T")
+        root = ET.fromstring(xml)
+        ratings_el = root.find("ratings")
+        assert ratings_el is None
+
+    def test_old_rating_param_backward_compat(self):
+        """rating=9.5 still emits flat <rating> element."""
+        xml = build_movie_nfo(title="T", rating=9.5)
+        root = ET.fromstring(xml)
+        # Should have flat <rating> element, not <ratings> wrapper
+        ratings_wrapper = root.find("ratings")
+        assert ratings_wrapper is None
+        rating_el = root.find("rating")
+        assert rating_el is not None
+        assert rating_el.text == "9.5"
+
+
+class TestBuildMovieNfoParasocialKey:
+    """Tests for build_movie_nfo parasocial_key parameter."""
+
+    def test_parasocial_key_as_uniqueid(self):
+        """parasocial_key produces <uniqueid type="parasocial" default="true">."""
+        xml = build_movie_nfo(title="T", parasocial_key="pk1")
+        root = ET.fromstring(xml)
+        uids = root.findall("uniqueid")
+        assert len(uids) == 1
+        assert uids[0].get("type") == "parasocial"
+        assert uids[0].get("default") == "true"
+        assert uids[0].text == "pk1"
+
+    def test_parasocial_key_with_uniqueid_dict(self):
+        """Both parasocial and imdb uniqueids present."""
+        xml = build_movie_nfo(
+            title="T", uniqueid={"imdb": "tt12345"}, parasocial_key="pk1"
+        )
+        root = ET.fromstring(xml)
+        uids = root.findall("uniqueid")
+        assert len(uids) == 2
+        types = {u.get("type"): u.text for u in uids}
+        assert types["imdb"] == "tt12345"
+        assert types["parasocial"] == "pk1"
+        # imdb should be default, parasocial should not
+        for u in uids:
+            if u.get("type") == "imdb":
+                assert u.get("default") == "true"
+            elif u.get("type") == "parasocial":
+                assert u.get("default") != "true"
+
+
+class TestBuildMovieNfoDictActors:
+    """Tests for dict actor support in build_movie_nfo."""
+
+    def test_dict_actor_with_role_and_order(self):
+        """Dict actor produces <name>, <role>, <order>."""
+        xml = build_movie_nfo(
+            title="T",
+            actors=[{"name": "John", "role": "Hero", "order": 1}],
+        )
+        root = ET.fromstring(xml)
+        actors = root.findall("actor")
+        assert len(actors) == 1
+        assert actors[0].find("name").text == "John"
+        assert actors[0].find("role").text == "Hero"
+        assert actors[0].find("order").text == "1"
+
+    def test_dict_actor_with_thumb(self):
+        """Dict actor produces <thumb>."""
+        xml = build_movie_nfo(
+            title="T",
+            actors=[{"name": "Jane", "thumb": "http://example.com/jane.jpg"}],
+        )
+        root = ET.fromstring(xml)
+        actors = root.findall("actor")
+        assert len(actors) == 1
+        assert actors[0].find("name").text == "Jane"
+        assert actors[0].find("thumb").text == "http://example.com/jane.jpg"
+
+    def test_string_actor_backward_compat(self):
+        """String actor still works, no role/order."""
+        xml = build_movie_nfo(title="T", actors=["Actor Name"])
+        root = ET.fromstring(xml)
+        actors = root.findall("actor")
+        assert len(actors) == 1
+        assert actors[0].find("name").text == "Actor Name"
+        assert actors[0].find("role") is None
+        assert actors[0].find("order") is None
 
 
 class TestGenerateNfo:
@@ -450,10 +602,10 @@ class TestGenerateNfo:
         assert year.text == "2024"
 
     def test_generate_with_releasedate(self):
-        """generate_nfo parses releasedate from dict."""
+        """generate_nfo parses releasedate and emits <premiered>."""
         xml = generate_nfo({"title": "Test", "releasedate": "1609459200"})
         root = ET.fromstring(xml)
-        rd = root.find("releasedate")
+        rd = root.find("premiered")
         assert rd is not None
         assert rd.text == "2021-01-01"
 
@@ -463,7 +615,7 @@ class TestGenerateNfo:
             {"title": "Test", "releasedate": "100"}, validate_epoch=False
         )
         root = ET.fromstring(xml)
-        rd = root.find("releasedate")
+        rd = root.find("premiered")
         assert rd is not None
         assert rd.text == "1970-01-01"
 
@@ -471,7 +623,7 @@ class TestGenerateNfo:
         """generate_nfo with validate_epoch=True rejects small epoch values."""
         xml = generate_nfo({"title": "Test", "releasedate": "100"}, validate_epoch=True)
         root = ET.fromstring(xml)
-        rd = root.find("releasedate")
+        rd = root.find("premiered")
         assert rd is None
 
     def test_generate_with_kick_suffix(self):
@@ -482,14 +634,14 @@ class TestGenerateNfo:
         assert title.text == "My Stream (KICK)"
 
     def test_generate_with_kick_tag(self):
-        """generate_nfo passes kick_tag to build_movie_nfo."""
+        """generate_nfo passes kick_tag to build_movie_nfo as <tag>."""
         xml = generate_nfo({"title": "My Stream"}, kick_tag=True)
         root = ET.fromstring(xml)
-        genres = [g.text for g in root.findall("genre")]
-        assert "Kick Vod" in genres
+        tags = [t.text for t in root.findall("tag")]
+        assert "Kick Vod" in tags
 
     def test_generate_uses_tags_as_genres_fallback(self):
-        """generate_nfo uses 'tags' key as fallback for genres."""
+        """generate_nfo uses 'tags' key as fallback for genres when no genres key."""
         xml = generate_nfo({"title": "Test", "tags": ["Action", "Comedy"]})
         root = ET.fromstring(xml)
         genres = [g.text for g in root.findall("genre")]
@@ -512,11 +664,12 @@ class TestGenerateNfo:
         assert orig.text == "Original"
 
     def test_generate_with_collections(self):
-        """generate_nfo passes collections from dict."""
+        """generate_nfo passes collections as <set><name> elements."""
         xml = generate_nfo({"title": "Test", "collections": ["Coll1"]})
         root = ET.fromstring(xml)
-        collections = root.find("collections")
-        assert collections is not None
+        sets = root.findall("set")
+        assert len(sets) == 1
+        assert sets[0].find("name").text == "Coll1"
 
     def test_generate_with_actors(self):
         """generate_nfo passes actors from dict."""
@@ -562,3 +715,42 @@ class TestGenerateNfo:
         genres = [g.text for g in root.findall("genre")]
         assert "Action" not in genres
         assert len(genres) == 0
+
+    def test_generate_with_tags(self):
+        """generate_nfo with both genres and tags keys maps tags to <tag> elements."""
+        xml = generate_nfo({"title": "Test", "genres": ["Drama"], "tags": ["Action"]})
+        root = ET.fromstring(xml)
+        tags = [t.text for t in root.findall("tag")]
+        assert "Action" in tags
+
+    def test_generate_with_parasocial_key(self):
+        """generate_nfo passes parasocial_key to build_movie_nfo."""
+        xml = generate_nfo({"title": "Test", "parasocial_key": "pk1"})
+        root = ET.fromstring(xml)
+        uids = root.findall("uniqueid")
+        assert len(uids) == 1
+        assert uids[0].get("type") == "parasocial"
+        assert uids[0].text == "pk1"
+
+    def test_generate_with_ratings(self):
+        """generate_nfo passes ratings to build_movie_nfo."""
+        xml = generate_nfo(
+            {
+                "title": "Test",
+                "ratings": [{"name": "imdb", "max": 10, "value": 8.0, "default": True}],
+            }
+        )
+        root = ET.fromstring(xml)
+        ratings_el = root.find("ratings")
+        assert ratings_el is not None
+        rating_el = ratings_el.find("rating")
+        assert rating_el.get("name") == "imdb"
+
+    def test_generate_separates_genres_and_tags(self):
+        """Both genres and tags keys present map to separate elements."""
+        xml = generate_nfo({"title": "Test", "genres": ["Drama"], "tags": ["Action"]})
+        root = ET.fromstring(xml)
+        genres = [g.text for g in root.findall("genre")]
+        tags = [t.text for t in root.findall("tag")]
+        assert "Drama" in genres
+        assert "Action" in tags
