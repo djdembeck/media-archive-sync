@@ -189,7 +189,7 @@ def build_movie_nfo(
         name_el.text = ss
 
     if actors:
-        seen_actors = set()
+        seen_actors: dict[str, dict[str, Any]] = {}
         if isinstance(actors, str):
             actor_list = [actors]
         elif isinstance(actors, set):
@@ -201,7 +201,6 @@ def build_movie_nfo(
         for actor_item in actor_list:
             if not actor_item:
                 continue
-            # Handle dict actors with name, role, order, thumb keys
             if isinstance(actor_item, dict):
                 actor_name = actor_item.get("name")
                 if not actor_name:
@@ -211,12 +210,22 @@ def build_movie_nfo(
                     continue
                 key = name.lower()
                 if key in seen_actors:
+                    if seen_actors[key]["type"] == "string":
+                        actor_el = seen_actors[key]["actor_el"]
+                        if "role" in actor_item and actor_item["role"]:
+                            role_el = ET.SubElement(actor_el, "role")
+                            role_el.text = str(actor_item["role"]).strip()
+                        if "order" in actor_item and actor_item["order"] is not None:
+                            order_el = ET.SubElement(actor_el, "order")
+                            order_el.text = str(actor_item["order"])
+                        if "thumb" in actor_item and actor_item["thumb"]:
+                            thumb_el = ET.SubElement(actor_el, "thumb")
+                            thumb_el.text = str(actor_item["thumb"]).strip()
+                        seen_actors[key]["type"] = "dict"
                     continue
-                seen_actors.add(key)
                 actor_el = ET.SubElement(movie, "actor")
                 name_el = ET.SubElement(actor_el, "name")
                 name_el.text = name
-                # Add optional subelements only if present
                 if "role" in actor_item and actor_item["role"]:
                     role_el = ET.SubElement(actor_el, "role")
                     role_el.text = str(actor_item["role"]).strip()
@@ -226,18 +235,18 @@ def build_movie_nfo(
                 if "thumb" in actor_item and actor_item["thumb"]:
                     thumb_el = ET.SubElement(actor_el, "thumb")
                     thumb_el.text = str(actor_item["thumb"]).strip()
+                seen_actors[key] = {"type": "dict", "actor_el": actor_el}
             else:
-                # String actor
                 name = str(actor_item).strip()
                 if not name:
                     continue
                 key = name.lower()
                 if key in seen_actors:
                     continue
-                seen_actors.add(key)
                 actor_el = ET.SubElement(movie, "actor")
                 name_el = ET.SubElement(actor_el, "name")
                 name_el.text = name
+                seen_actors[key] = {"type": "string", "actor_el": actor_el}
 
     # Add genres
     seen_genres: set[str] = set()
@@ -295,19 +304,23 @@ def build_movie_nfo(
 
     # Add ratings (new structure with <ratings> wrapper)
     if ratings:
-        ratings_el = ET.SubElement(movie, "ratings")
+        ratings_el = None
         for rating_dict in ratings:
             if not isinstance(rating_dict, dict):
                 continue
             rating_name = rating_dict.get("name", "")
             if not rating_name:
                 continue
+            if ratings_el is None:
+                ratings_el = ET.SubElement(movie, "ratings")
             rating_entry_el = ET.SubElement(ratings_el, "rating")
             rating_entry_el.set("name", str(rating_name))
             if "max" in rating_dict and rating_dict["max"] is not None:
                 rating_entry_el.set("max", str(rating_dict["max"]))
-            if "default" in rating_dict and rating_dict["default"]:
-                rating_entry_el.set("default", "true")
+            if "default" in rating_dict:
+                rating_entry_el.set(
+                    "default", "true" if rating_dict["default"] else "false"
+                )
             if "value" in rating_dict and rating_dict["value"] is not None:
                 value_el = ET.SubElement(rating_entry_el, "value")
                 value_el.text = str(rating_dict["value"])
