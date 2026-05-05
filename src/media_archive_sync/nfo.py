@@ -314,8 +314,7 @@ def build_movie_nfo(
             if "votes" in rating_dict and rating_dict["votes"] is not None:
                 votes_el = ET.SubElement(rating_entry_el, "votes")
                 votes_el.text = str(rating_dict["votes"])
-    elif rating is not None:
-        # Backward compat: flat <rating> element
+    elif ratings is None and rating is not None:
         _add_text("rating", rating)
 
     # Add unique IDs
@@ -337,6 +336,8 @@ def build_movie_nfo(
         )
         if not has_default:
             uid_el.set("default", "true")
+        else:
+            uid_el.set("default", "false")
         uid_el.text = str(parasocial_key)
 
     return ET.tostring(movie, encoding="unicode")
