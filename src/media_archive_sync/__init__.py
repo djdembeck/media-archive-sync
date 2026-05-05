@@ -1,6 +1,6 @@
 """Media Archive Sync - Download and organize media from web archives."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from .cache import (
     Cache,
