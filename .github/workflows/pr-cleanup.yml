@@ -1,0 +1,27 @@
+name: PR Image Cleanup
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: pr-cleanup-${{ github.event.pull_request.number }}
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Delete PR Docker image
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_TAG="pr-${{ github.event.pull_request.number }}"
+          VERSION_ID=$(gh api "/users/${{ github.repository_owner }}/packages/container/${{ github.event.repository.name }}/versions" --jq ".[] | select(.metadata.container.tags[] | contains(\"$PR_TAG\")) | .id" 2>/dev/null | head -1)
+          if [ -n "$VERSION_ID" ]; then
+            gh api --method DELETE "/users/${{ github.repository_owner }}/packages/container/${{ github.event.repository.name }}/versions/$VERSION_ID"
+          fi

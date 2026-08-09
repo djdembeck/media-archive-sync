@@ -1,6 +1,10 @@
 # Build stage
 FROM python:3.13-slim AS builder
 
+# Version stamp — passed by release.yml: --build-arg VERSION="${VERSION}"
+# Defaults to "devel" for local/PR/develop builds.
+ARG VERSION=devel
+
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
