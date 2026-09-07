@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import json
 import signal
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -172,6 +174,406 @@ def download_file(
     except Exception as exc:
         logger.error("Unexpected error downloading %s: %s", url, exc)
         return False, 0
+
+
+@dataclass(frozen=True)
+class TimeoutPolicy:
+    """Network timeout and retry policy for verified downloads."""
+
+    connect_seconds: float = 5
+    read_seconds: float = 30
+    retry_attempts: int = 3
+    backoff_seconds: float = 2.0
+
+
+@dataclass(frozen=True)
+class VerifiedDownload:
+    """Structured outcome of a verified staged download."""
+
+    ok: bool
+    bytes_downloaded: int
+    resumed: bool
+    final_path: Path | None
+    expected_size: int | None
+    remote_identity: dict | None
+    error_class: str | None = None
+    error_message: str | None = None
+
+
+def _verified_identity(path: Path) -> dict | None:
+    """Load a previously recorded source identity from a sidecar manifest."""
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _record_identity(path: Path, identity: dict, *, complete: bool) -> None:
+    """Persist the source identity sidecar atomically."""
+    payload = {
+        "content_length": identity.get("content_length"),
+        "etag": identity.get("etag"),
+        "last_modified": identity.get("last_modified"),
+        "complete": complete,
+    }
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _head_identity(session: requests.Session, url: str, timeout: tuple) -> dict:
+    """Discover the current remote identity via a HEAD request."""
+    response = session.head(url, timeout=timeout, allow_redirects=True)
+    response.raise_for_status()
+    raw_length = response.headers.get("Content-Length")
+    try:
+        length = int(raw_length) if raw_length is not None else None
+    except (TypeError, ValueError):
+        length = None
+    return {
+        "content_length": length,
+        "etag": response.headers.get("ETag"),
+        "last_modified": response.headers.get("Last-Modified"),
+    }
+
+
+def _range_start(response: requests.Response) -> int | None:
+    """Extract the first offset from a Content-Range header, if present."""
+    header = response.headers.get("Content-Range")
+    if not header or "-" not in header:
+        return None
+    start = header.split("-", 1)[0].rsplit(" ", 1)[-1]
+    try:
+        return int(start)
+    except ValueError:
+        return None
+
+
+def _range_total(response: requests.Response) -> int | None:
+    """Extract the total length from a Content-Range header, if present."""
+    header = response.headers.get("Content-Range")
+    if not header or "/" not in header:
+        return None
+    total = header.split("/", 1)[1].strip()
+    try:
+        return int(total)
+    except ValueError:
+        return None
+
+
+def _validate_resume(
+    recorded: dict | None, current: dict, partial_size: int, expected_size: int | None
+) -> bool:
+    """Decide whether an existing partial may be resumed from its offset.
+
+    A partial is discarded (False) when the remote identity cannot be
+    reconciled with the recorded sidecar: the current remote length is
+    <= the partial length, a recorded identifier (ETag/Last-Modified)
+    changed, the current length differs from the recorded expected length,
+    or the current length differs from the caller's expected length.
+    """
+    if recorded is None:
+        return False
+    recorded_length = recorded.get("content_length")
+    current_length = current.get("content_length")
+    if current_length is not None and current_length <= partial_size:
+        return False
+    if (
+        recorded_length is not None
+        and current_length is not None
+        and current_length != recorded_length
+    ):
+        return False
+    if (
+        expected_size is not None
+        and current_length is not None
+        and current_length != expected_size
+    ):
+        return False
+    for key in ("etag", "last_modified"):
+        previous = recorded.get(key)
+        if previous in (None, "") or previous == current.get(key):
+            continue
+        return False
+    return True
+
+
+def _read_body(
+    response: requests.Response,
+    staging_path: Path,
+    mode: str,
+    base: int,
+    chunk_size: int,
+    progress: Callable[[int, int], None] | None,
+    expected_size: int | None,
+) -> int:
+    """Stream a response body into the staging file; return total bytes."""
+    total = base
+    if expected_size is not None:
+        reported_total = expected_size
+    else:
+        header_size = int(response.headers.get("Content-Length", -1) or -1)
+        reported_total = base + header_size if header_size > 0 else -1
+    with open(staging_path, mode) as handle:
+        for chunk in response.iter_content(chunk_size=chunk_size):
+            if chunk:
+                handle.write(chunk)
+                total += len(chunk)
+                if progress:
+                    progress(total, reported_total)
+    return total
+
+
+def _resume_decision(
+    recorded: dict | None,
+    current: dict,
+    partial_size: int,
+    expected_size: int | None,
+) -> bool:
+    """Whether a non-empty partial must be discarded before this attempt."""
+    if partial_size <= 0:
+        return False
+    if recorded is None:
+        return True
+    return not _validate_resume(recorded, current, partial_size, expected_size)
+
+
+def _range_outcome(
+    response: requests.Response, partial_size: int, expected_size: int | None
+) -> tuple[str, str | None]:
+    """Validate a resume response; return (action, error).
+
+    Actions: "read" (use this body), "restart" (safe to retry from byte
+    zero without consuming a retry attempt), "fail" (immediate, unretryable
+    error; ``error`` carries the error class), "raise" (HTTP error to raise).
+    """
+    status = response.status_code
+    if status == 416:
+        return "fail", "RangeNotSatisfiable"
+    if partial_size <= 0:
+        if status not in (200, 206):
+            return "raise", None
+        return "read", None
+    if status != 206:
+        if status != 200:
+            return "raise", None
+        # Range ignored: the body is the full object, restart from zero.
+        return "restart", None
+    header_start = _range_start(response)
+    if header_start != partial_size:
+        logger.warning(
+            "Content-Range start %r != %d; restarting", header_start, partial_size
+        )
+        return "restart", None
+    total = _range_total(response)
+    if expected_size is not None and total is not None and total != expected_size:
+        logger.warning("Content-Range total %d != %d; restarting", total, expected_size)
+        return "restart", None
+    return "read", None
+
+
+def _verified_failure(
+    expected_size: int | None,
+    remote_identity: dict | None,
+    error_class: str,
+    error_message: str,
+    *,
+    ok_bytes: int = 0,
+    final_path: Path | None = None,
+    resumed: bool = False,
+) -> VerifiedDownload:
+    """Build a structured failure outcome."""
+    return VerifiedDownload(
+        ok=False,
+        bytes_downloaded=ok_bytes,
+        resumed=resumed,
+        final_path=final_path,
+        expected_size=expected_size,
+        remote_identity=remote_identity,
+        error_class=error_class,
+        error_message=error_message,
+    )
+
+
+def _verified_attempt(
+    session: requests.Session,
+    url: str,
+    staging_path: Path,
+    manifest_path: Path,
+    current: dict,
+    expected_size: int | None,
+    timeout_pair: tuple,
+    progress: Callable[[int, int], None] | None,
+) -> tuple[bool, str | None]:
+    """Run one full download pass (resume or fresh) until it completes.
+
+    Returns ``(resumed, fail_class)``. ``fail_class`` is ``None`` on
+    success or ``"RangeNotSatisfiable"`` when a 416 makes the partial
+    unrecoverable. Connection errors propagate to the caller, which owns
+    the retry/backoff budget. Range-not-honored cases are handled here
+    (safe restart from byte zero) without consuming a retry attempt.
+    """
+    while True:
+        partial_size = staging_path.stat().st_size if staging_path.is_file() else 0
+        recorded = _verified_identity(manifest_path)
+        if _resume_decision(recorded, current, partial_size, expected_size):
+            logger.warning(
+                "Discarding %s: source identity not reconciled", staging_path
+            )
+            staging_path.unlink(missing_ok=True)
+            partial_size = 0
+        _record_identity(manifest_path, current, complete=False)
+        resumed = False
+        headers: dict[str, str] = {}
+        if partial_size > 0:
+            headers["Range"] = f"bytes={partial_size}-"
+        with session.get(
+            url, stream=True, timeout=timeout_pair, headers=headers
+        ) as response:
+            action, fail_class = _range_outcome(response, partial_size, expected_size)
+            if action == "restart":
+                logger.warning(
+                    "Range resume not honored (%s); restarting",
+                    response.status_code,
+                )
+                response.close()
+                staging_path.unlink(missing_ok=True)
+                continue
+            if action == "fail":
+                staging_path.unlink(missing_ok=True)
+                return resumed, fail_class
+            if action == "raise":
+                response.raise_for_status()
+            mode = "ab" if response.status_code == 206 else "wb"
+            if mode == "ab":
+                resumed = True
+            _read_body(
+                response,
+                staging_path,
+                mode,
+                partial_size,
+                DEFAULT_CHUNK_SIZE,
+                progress,
+                expected_size,
+            )
+        _record_identity(manifest_path, current, complete=True)
+        return resumed, None
+
+
+def download_verified(
+    url: str,
+    staging_path: Path,
+    *,
+    expected_size: int | None,
+    timeout: TimeoutPolicy | None = None,
+    progress: Callable[[int, int], None] | None = None,
+    session: requests.Session | None = None,
+    identity_manifest_path: Path | None = None,
+) -> VerifiedDownload:
+    """Perform a resumable, identity-verified staged download.
+
+    Writes to ``staging_path`` (a .partial file) and never renames it to a
+    final media path; callers perform that rename themselves. The current
+    remote identity (Content-Length, ETag, Last-Modified) is recorded in an
+    identity sidecar so resumptions can be validated.
+
+    Args:
+        url: The URL to download from.
+        staging_path: The .partial target to write to.
+        expected_size: Expected final byte count, or None when unknown.
+        timeout: Timeout/retry policy (defaults to TimeoutPolicy()).
+        progress: Optional callback(downloaded_total, expected_or_-1).
+        session: Optional requests.Session (creates one if None).
+        identity_manifest_path: Sidecar JSON path (defaults to
+            staging_path + '.identity.json').
+
+    Returns:
+        A structured VerifiedDownload outcome; errors never escape.
+    """
+    policy = timeout or TimeoutPolicy()
+    timeout_pair: tuple = (policy.connect_seconds, policy.read_seconds)
+    own_session = session is None
+    if own_session:
+        session = requests.Session()
+    manifest_path = (
+        identity_manifest_path
+        if identity_manifest_path is not None
+        else staging_path.parent / (staging_path.name + ".identity.json")
+    )
+    staging_path.parent.mkdir(parents=True, exist_ok=True)
+
+    current: dict | None = None
+    error_class: str | None = None
+    error_message: str | None = None
+    try:
+        for attempt in range(policy.retry_attempts):
+            if attempt > 0:
+                time.sleep(policy.backoff_seconds)
+            try:
+                current = _head_identity(session, url, timeout_pair)
+                resumed, fail_class = _verified_attempt(
+                    session,
+                    url,
+                    staging_path,
+                    manifest_path,
+                    current,
+                    expected_size,
+                    timeout_pair,
+                    progress,
+                )
+            except (requests.RequestException, OSError) as exc:
+                error_class = type(exc).__name__
+                error_message = str(exc)
+                logger.warning(
+                    "Attempt %d/%d failed for %s: %s: %s",
+                    attempt + 1,
+                    policy.retry_attempts,
+                    url,
+                    error_class,
+                    error_message,
+                )
+                continue
+            if fail_class is not None:
+                return _verified_failure(
+                    expected_size,
+                    current,
+                    fail_class,
+                    "HTTP 416: partial not resolvable",
+                )
+            final_size = staging_path.stat().st_size
+            if expected_size is not None and final_size != expected_size:
+                return _verified_failure(
+                    expected_size,
+                    current,
+                    "SizeMismatch",
+                    f"final size {final_size} != expected {expected_size}",
+                    ok_bytes=final_size,
+                    final_path=staging_path,
+                    resumed=resumed,
+                )
+            return VerifiedDownload(
+                ok=True,
+                bytes_downloaded=final_size,
+                resumed=resumed,
+                final_path=staging_path,
+                expected_size=expected_size,
+                remote_identity=current,
+            )
+    finally:
+        if own_session:
+            session.close()
+    final_path = staging_path if staging_path.is_file() else None
+    return _verified_failure(
+        expected_size,
+        current,
+        error_class or "RetriesExhausted",
+        error_message or "all retry attempts failed",
+        ok_bytes=final_path.stat().st_size if final_path is not None else 0,
+        final_path=final_path,
+    )
 
 
 def download_files(
@@ -592,8 +994,11 @@ def download_with_config(
 
 
 __all__ = [
+    "TimeoutPolicy",
+    "VerifiedDownload",
     "download_file",
     "download_files",
     "download_with_config",
+    "download_verified",
     "DownloadManager",
 ]

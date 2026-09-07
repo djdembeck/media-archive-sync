@@ -27,8 +27,11 @@ from .crawler import (
 )
 from .downloader import (
     DownloadManager,
+    TimeoutPolicy,
+    VerifiedDownload,
     download_file,
     download_files,
+    download_verified,
     download_with_config,
 )
 from .logging import get_logger
@@ -110,6 +113,9 @@ __all__ = [
     "download_file",
     "download_files",
     "download_with_config",
+    "download_verified",
+    "TimeoutPolicy",
+    "VerifiedDownload",
     "DownloadManager",
     "merge_video_parts",
     "detect_video_parts",
