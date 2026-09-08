@@ -13,12 +13,15 @@ import concurrent.futures
 import contextlib
 import json
 import signal
+import socket
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from ipaddress import IPv4Address, IPv6Address, ip_address
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urljoin, urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -34,6 +37,129 @@ class DownloadCancelledError(Exception):
     """Raised when a download is cancelled via stop event."""
 
     pass
+
+
+class _StagingFileChangedError(OSError):
+    """The staging file was modified by another writer (single-writer
+    invariant broken); detected before an append. Handled as a clean
+    restart from byte zero by _verified_attempt."""
+
+    pass
+
+
+class URLPolicyError(requests.RequestException):
+    """A URL (or redirect target) violated the public-address policy.
+
+    Raised as a subclass of :class:`requests.RequestException` so callers
+    treat it as a normal network failure.
+    """
+
+    pass
+
+
+def _is_disallowed_address(address: object) -> bool:
+    """True when an IP address must never be fetched from (SSRF guard)."""
+    if isinstance(address, (IPv4Address, IPv6Address)):
+        return (
+            address.is_private
+            or address.is_loopback
+            or address.is_link_local
+            or address.is_reserved
+            or address.is_multicast
+            or address.is_unspecified
+        )
+    return True  # not an IPv4/IPv6 literal: fail closed
+
+
+def _is_local_address(address: object) -> bool:
+    """True when an IP address is private, loopback, or link-local."""
+    if not isinstance(address, (IPv4Address, IPv6Address)):
+        return False
+    return address.is_private or address.is_loopback or address.is_link_local
+
+
+def _assert_public_url(url: str, *, allow_local: bool = False) -> None:
+    """Raise URLPolicyError unless ``url`` satisfies the fetch policy.
+
+    Requires an http/https scheme and no userinfo. The hostname must
+    resolve, and *every* resolved address must be acceptable: by default
+    only public addresses pass (private, loopback, link-local, reserved,
+    multicast and unspecified ranges are rejected, fail closed). With
+    ``allow_local=True`` — used only for the operator-chosen initial
+    URL, which may legitimately be loopback (a local media server) —
+    private/loopback/link-local addresses are additionally permitted;
+    reserved/multicast/unspecified remain rejected.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise URLPolicyError(f"URL scheme not allowed (need http/https): {url}")
+    if parsed.username is not None or parsed.password is not None:
+        raise URLPolicyError(f"URL userinfo not allowed: {url}")
+    hostname = parsed.hostname
+    if not hostname:
+        raise URLPolicyError(f"URL has no hostname: {url}")
+    try:
+        infos = socket.getaddrinfo(hostname, parsed.port or 80)
+    except (OSError, ValueError) as exc:
+        raise URLPolicyError(f"Cannot resolve hostname for {url}: {exc}") from exc
+    for info in infos:
+        literal = info[4][0]
+        try:
+            ip = ip_address(literal)
+        except ValueError as exc:
+            raise URLPolicyError(f"Unparseable resolved address for {url}") from exc
+        if _is_disallowed_address(ip) and not (allow_local and _is_local_address(ip)):
+            raise URLPolicyError(f"Resolved address not public for {url}: {ip}")
+
+
+def _url_policy_hook(
+    response: requests.Response, **_kwargs: object
+) -> requests.Response:
+    """Session hook: validate each fetched URL and redirect target.
+
+    Runs after every response — including each redirect hop, which is a
+    separate request through this same session (verified empirically:
+    with ``allow_redirects=True`` the hook fires per hop, and an
+    exception raised inside propagates out of the request). ``response.next``
+    is ``None`` under ``allow_redirects=True``, so the redirect target
+    must be derived from the ``Location`` header, relative to the
+    response URL, via :func:`urllib.parse.urljoin`.
+
+    Trust split: the response to the *initial* request is checked with
+    ``allow_local=True`` — that address is the operator-chosen initial
+    URL (approved with that trust by the caller). Every response after
+    the first was fetched at a redirect target, so its URL is checked
+    strictly (the rebinding window between the operator's check and the
+    hop's connect stays closed). The Location target of any redirect is
+    always checked strictly: the operator never chose redirect targets,
+    so a server must never bounce the download to an internal address.
+    """
+    if response.url:
+        # Post-redirect responses were fetched at a Location target:
+        # strictly public-only. Only the very first response (no history)
+        # may be the operator-chosen local URL.
+        _assert_public_url(
+            response.url,
+            allow_local=(len(response.history) == 0),
+        )
+    if response.is_redirect:
+        location = response.headers.get("Location")
+        if location:
+            _assert_public_url(urljoin(response.url, location))
+    return response
+
+
+def _install_url_policy(session: requests.Session) -> None:
+    """Register the redirect policy hook on ``session`` (idempotent)."""
+    if getattr(session, "_mas_url_policy_installed", False):
+        return
+    session.hooks = {
+        "response": [
+            *(session.hooks.get("response", ())),
+            _url_policy_hook,
+        ]
+    }
+    session._mas_url_policy_installed = True  # type: ignore[attr-defined]
 
 
 # Default configuration values
@@ -188,7 +314,12 @@ class TimeoutPolicy:
 
 @dataclass(frozen=True)
 class VerifiedDownload:
-    """Structured outcome of a verified staged download."""
+    """Structured outcome of a verified staged download.
+
+    ``bytes_downloaded`` is the total bytes present in the final staging
+    file, NOT the bytes transferred by this call: on a resumed download
+    it includes bytes already staged by prior calls.
+    """
 
     ok: bool
     bytes_downloaded: int
@@ -269,14 +400,26 @@ def _validate_resume(
 ) -> bool:
     """Decide whether an existing partial may be resumed from its offset.
 
-    A partial is discarded (False) when the remote identity cannot be
-    reconciled with the recorded sidecar: the current remote length is
-    <= the partial length, a recorded identifier (ETag/Last-Modified)
-    changed, the current length differs from the recorded expected length,
-    or the current length differs from the caller's expected length.
+    Resumption requires a matching persisted validator: at least one of
+    ETag/Last-Modified must be present (non-empty) in the recorded sidecar,
+    currently present, and equal — length alone never suffices, because a
+    same-length replacement would otherwise be appended to the old partial.
+    A partial is discarded (False) when the recorded sidecar is missing,
+    the current remote length is <= the partial length, a recorded
+    identifier (ETag/Last-Modified) changed, the current length differs
+    from the recorded expected length, the current length differs from the
+    caller's expected length, or no such validator exists. A recorded
+    empty-string identifier is not an identifier at all and can never
+    satisfy the validator rule. A manifest that claims complete=True
+    requires the partial to actually hold the recorded full length; a
+    truncated "complete" partial is discarded.
     """
     if recorded is None:
         return False
+    if recorded.get("complete") is True:
+        recorded_full_length = recorded.get("content_length")
+        if recorded_full_length != partial_size:
+            return False
     recorded_length = recorded.get("content_length")
     current_length = current.get("content_length")
     if current_length is not None and current_length <= partial_size:
@@ -293,12 +436,19 @@ def _validate_resume(
         and current_length != expected_size
     ):
         return False
+    validator_matched = False
     for key in ("etag", "last_modified"):
         previous = recorded.get(key)
-        if previous in (None, "") or previous == current.get(key):
+        if previous in (None, ""):
             continue
-        return False
-    return True
+        current_value = current.get(key)
+        if current_value is None:
+            continue  # validator unavailable now: untrusted, but not a conflict
+        if previous == current_value:
+            validator_matched = True
+        else:
+            return False
+    return validator_matched
 
 
 def _read_body(
@@ -310,8 +460,28 @@ def _read_body(
     progress: Callable[[int, int], None] | None,
     expected_size: int | None,
 ) -> int:
-    """Stream a response body into the staging file; return total bytes."""
+    """Stream a response body into the staging file; return total bytes.
+
+    Single-writer invariant: exactly one download owns ``staging_path``
+    at a time (callers give each download its own staging path). The
+    size check below guards the append: in "ab" mode the file must still
+    hold exactly ``base`` bytes, otherwise something else modified it and
+    the append would corrupt the partial, so raise
+    _StagingFileChangedError and let the caller restart from zero.
+    """
     total = base
+    if mode == "ab":
+        try:
+            actual = staging_path.stat().st_size
+        except OSError as exc:
+            raise _StagingFileChangedError(
+                f"Staging file {staging_path} vanished before append"
+            ) from exc
+        if actual != base:
+            raise _StagingFileChangedError(
+                f"Staging file {staging_path} changed before append: "
+                f"expected {base} bytes, found {actual}"
+            )
     if expected_size is not None:
         reported_total = expected_size
     else:
@@ -375,6 +545,69 @@ def _range_outcome(
     return "read", None
 
 
+def _get_identity_conflicts(response: requests.Response, current: dict) -> bool:
+    """True when the GET's identity headers contradict the HEAD identity.
+
+    The resume decision is based on the HEAD identity (``current``), but the
+    object may be replaced between HEAD and GET while keeping its length. In
+    that case a 206 (or 200) carries the NEW object's ETag/Last-Modified;
+    appending it would mix content from different objects while the final
+    byte-count check still passes. Only an actual conflict disqualifies: the
+    header must be present in both and differ. A header absent from the GET
+    (servers may omit it on ranged reads) must NOT force a restart.
+    """
+    for key in ("ETag", "Last-Modified"):
+        recorded = current.get(key.lower())
+        provided = response.headers.get(key)
+        if recorded and provided and recorded != provided:
+            return True
+    return False
+
+
+def _adopt_identity(current: dict, response: requests.Response) -> None:
+    """Re-sync ``current`` to the identity carried by ``response``.
+
+    Used when the GET conflicts with the HEAD identity: the object was
+    replaced in between. Adopting the GET's identifiers keeps the
+    recorded manifest, the outcome's ``remote_identity``, and any further
+    comparison aligned with the object actually served, and bounds the
+    restart to a single extra request (without this, a persistent
+    replacement would restart forever against the stale HEAD identity).
+    """
+    for header, key in (("ETag", "etag"), ("Last-Modified", "last_modified")):
+        value = response.headers.get(header)
+        if value is not None:
+            current[key] = value
+    if response.status_code == 206:
+        total = _range_total(response)
+    else:
+        raw = response.headers.get("Content-Length")
+        try:
+            total = int(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            total = None
+    if total is not None:
+        current["content_length"] = total
+
+
+def _enforce_confinement(download_root: Path, *paths: Path) -> None:
+    """Require each path to stay under ``download_root`` (resolved).
+
+    Symlinks are followed during resolution, so a path whose parent
+    chain escapes the root (directly or through a symlinked directory)
+    raises ValueError; this check runs before any mkdir/IO.
+    """
+    root = download_root.resolve()
+    for path in paths:
+        resolved = path.resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(
+                f"Path {path} escapes download root {download_root}"
+            ) from exc
+
+
 def _verified_failure(
     expected_size: int | None,
     remote_identity: dict | None,
@@ -396,6 +629,19 @@ def _verified_failure(
         error_class=error_class,
         error_message=error_message,
     )
+
+
+def _drain_response(response: requests.Response) -> None:
+    """Fully consume the body of a streamed response that is discarded.
+
+    Closing a streamed response without reading it leaves unread bytes
+    on the wire, which can desynchronize a pooled connection; draining
+    is bounded by the server's declared Content-Length/Content-Range.
+    Failures to drain are irrelevant (the body is being thrown away).
+    """
+    with contextlib.suppress(Exception):
+        for _chunk in response.iter_content(chunk_size=65536):
+            pass
 
 
 def _verified_attempt(
@@ -439,6 +685,7 @@ def _verified_attempt(
                     "Range resume not honored (%s); restarting",
                     response.status_code,
                 )
+                _drain_response(response)
                 response.close()
                 staging_path.unlink(missing_ok=True)
                 continue
@@ -447,19 +694,51 @@ def _verified_attempt(
                 return resumed, fail_class
             if action == "raise":
                 response.raise_for_status()
+            if action == "read" and _get_identity_conflicts(response, current):
+                # The resume decision was based on the HEAD identity, but the
+                # GET may serve an object replaced in between (same length,
+                # different ETag/Last-Modified): appending that body would
+                # mix content while the final byte-count check still passes.
+                # Restart from zero; adopt the served identity so the retry
+                # does not conflict against the stale HEAD identity forever.
+                logger.warning(
+                    "GET identity conflicts with HEAD identity; restarting",
+                )
+                _adopt_identity(current, response)
+                _drain_response(response)
+                response.close()
+                staging_path.unlink(missing_ok=True)
+                continue
             mode = "ab" if response.status_code == 206 else "wb"
             if mode == "ab":
                 resumed = True
-            _read_body(
-                response,
-                staging_path,
-                mode,
-                partial_size,
-                DEFAULT_CHUNK_SIZE,
-                progress,
-                expected_size,
-            )
-        _record_identity(manifest_path, current, complete=True)
+            try:
+                _read_body(
+                    response,
+                    staging_path,
+                    mode,
+                    partial_size,
+                    DEFAULT_CHUNK_SIZE,
+                    progress,
+                    expected_size,
+                )
+            except _StagingFileChangedError:
+                # Another writer touched the partial after the resume
+                # decision; the appended body would be corrupt. Discard
+                # it and restart from byte zero in the next pass.
+                logger.warning(
+                    "Staging file %s modified before append; restarting",
+                    staging_path,
+                )
+                _drain_response(response)
+                response.close()
+                staging_path.unlink(missing_ok=True)
+                continue
+        # The download is byte-complete but NOT yet verified: the final
+        # size check runs in download_verified, which owns the complete
+        # mark. Recording complete=True here would let a SizeMismatch
+        # failure leave a manifest claiming completion it never earned.
+        _record_identity(manifest_path, current, complete=False)
         return resumed, None
 
 
@@ -472,6 +751,7 @@ def download_verified(
     progress: Callable[[int, int], None] | None = None,
     session: requests.Session | None = None,
     identity_manifest_path: Path | None = None,
+    download_root: Path | None = None,
 ) -> VerifiedDownload:
     """Perform a resumable, identity-verified staged download.
 
@@ -479,6 +759,31 @@ def download_verified(
     final media path; callers perform that rename themselves. The current
     remote identity (Content-Length, ETag, Last-Modified) is recorded in an
     identity sidecar so resumptions can be validated.
+
+    URL policy (SSRF guard): the initial ``url`` must be http(s) without
+    userinfo, and every resolved address must be public — except that
+    loopback/private/link-local targets are permitted for the initial URL
+    itself (an operator may intentionally download from a local media
+    server). Every redirect hop is strictly public-only: a server that
+    bounces the download to an internal address fails the download as a
+    network error (URLPolicyError, a requests.RequestException).
+
+    Path confinement: when ``download_root`` is given, ``staging_path``,
+    the identity manifest, and the manifest's tmp sibling must all
+    resolve inside it (ValueError before any mkdir/IO), and a symlink
+    staging path is refused. When it is None, confinement is disabled
+    and a warning is logged.
+
+    Race window (accepted trade-off): the identity used for the resume
+    decision is discovered via a HEAD request, and the body is fetched in
+    a separate GET. If the object is *replaced between the HEAD and the
+    GET* while keeping its length, a 206 for the new object would be
+    appended to the old partial. That replacement is detected only when the
+    GET carries an ETag/Last-Modified header that conflicts with the HEAD
+    identity (the GET-header check in _verified_attempt forces a restart).
+    A GET that omits identity headers entirely cannot be distinguished from
+    a legitimate same-length re-fetch, so it cannot be detected; this is
+    the accepted residual risk of the HEAD-then-GET protocol.
 
     Args:
         url: The URL to download from.
@@ -489,9 +794,15 @@ def download_verified(
         session: Optional requests.Session (creates one if None).
         identity_manifest_path: Sidecar JSON path (defaults to
             staging_path + '.identity.json').
+        download_root: When given, staging/manifest paths must resolve
+            under it and symlinks at the staging path are refused;
+            None disables confinement (warns).
 
     Returns:
         A structured VerifiedDownload outcome; errors never escape.
+        ``bytes_downloaded`` is the total bytes present in the final
+        staging file — NOT the bytes transferred by this call: on a
+        resumed download it includes bytes written by prior calls.
     """
     policy = timeout or TimeoutPolicy()
     timeout_pair: tuple = (policy.connect_seconds, policy.read_seconds)
@@ -503,13 +814,44 @@ def download_verified(
         if identity_manifest_path is not None
         else staging_path.parent / (staging_path.name + ".identity.json")
     )
+    if download_root is not None:
+        _enforce_confinement(
+            download_root,
+            staging_path,
+            manifest_path,
+            manifest_path.with_suffix(manifest_path.suffix + ".tmp"),
+        )
+        if staging_path.is_symlink():
+            raise ValueError(f"Staging path {staging_path} is a symlink")
+    else:
+        logger.warning(
+            "download_verified without download_root; path confinement "
+            "disabled for %s",
+            staging_path,
+        )
     staging_path.parent.mkdir(parents=True, exist_ok=True)
 
     current: dict | None = None
-    error_class: str | None = None
-    error_message: str | None = None
+    last_error_class: str | None = None
+    last_error_message: str | None = None
     assert session is not None  # narrowed by own_session branch above
+    _install_url_policy(session)
     try:
+        # The initial URL is operator-chosen: loopback/private/link-local
+        # targets are permitted (local media server); redirect hops are
+        # validated strictly by the session hook instead. A URL that
+        # fails here fails identically on every retry, so report the
+        # structured outcome immediately instead of burning the budget.
+        try:
+            _assert_public_url(url, allow_local=True)
+        except URLPolicyError as exc:
+            logger.warning("Initial URL rejected by policy for %s: %s", url, exc)
+            return _verified_failure(
+                expected_size,
+                None,
+                "URLPolicyError",
+                str(exc),
+            )
         for attempt in range(policy.retry_attempts):
             if attempt > 0:
                 time.sleep(policy.backoff_seconds)
@@ -525,16 +867,16 @@ def download_verified(
                     timeout_pair,
                     progress,
                 )
-            except (requests.RequestException, OSError) as exc:
-                error_class = type(exc).__name__
-                error_message = str(exc)
+            except (requests.RequestException, OSError, ValueError) as exc:
+                last_error_class = type(exc).__name__
+                last_error_message = str(exc)
                 logger.warning(
                     "Attempt %d/%d failed for %s: %s: %s",
                     attempt + 1,
                     policy.retry_attempts,
                     url,
-                    error_class,
-                    error_message,
+                    last_error_class,
+                    last_error_message,
                 )
                 continue
             if fail_class is not None:
@@ -544,17 +886,27 @@ def download_verified(
                     fail_class,
                     "HTTP 416: partial not resolvable",
                 )
-            final_size = staging_path.stat().st_size
-            if expected_size is not None and final_size != expected_size:
+            final_size = _stat_size(staging_path)
+            # When the caller did not pin an expected size, verify against
+            # the length the HEAD request discovered; only skip the check
+            # when both are unknown.
+            target = (
+                expected_size
+                if expected_size is not None
+                else current.get("content_length")
+            )
+            if target is not None and final_size != target:
                 return _verified_failure(
                     expected_size,
                     current,
                     "SizeMismatch",
-                    f"final size {final_size} != expected {expected_size}",
+                    f"final size {final_size} != expected {target}",
                     ok_bytes=final_size,
                     final_path=staging_path,
                     resumed=resumed,
                 )
+            # Verified: only now may the manifest claim completion.
+            _record_identity(manifest_path, current, complete=True)
             return VerifiedDownload(
                 ok=True,
                 bytes_downloaded=final_size,
@@ -567,14 +919,34 @@ def download_verified(
         if own_session and session is not None:
             session.close()
     final_path = staging_path if staging_path.is_file() else None
+    # Retries are exhausted: report the exhaustion, carrying the last
+    # attempt's concrete error for diagnostics.
+    last_error = (
+        f"last error: {last_error_class}: {last_error_message}"
+        if last_error_class is not None
+        else "all retry attempts failed"
+    )
     return _verified_failure(
         expected_size,
         current,
-        error_class or "RetriesExhausted",
-        error_message or "all retry attempts failed",
-        ok_bytes=final_path.stat().st_size if final_path is not None else 0,
+        "RetriesExhausted",
+        last_error,
+        ok_bytes=_stat_size(final_path) if final_path is not None else 0,
         final_path=final_path,
     )
+
+
+def _stat_size(path: Path) -> int:
+    """Staging file size, or 0 when it is gone or unstatable.
+
+    Final verification and failure reporting run outside the per-attempt
+    error guard; a stat failure there must not violate "errors never
+    escape".
+    """
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
 
 
 def download_files(
