@@ -563,7 +563,7 @@ def download_verified(
                 remote_identity=current,
             )
     finally:
-        if own_session:
+        if own_session and session is not None:
             session.close()
     final_path = staging_path if staging_path.is_file() else None
     return _verified_failure(
