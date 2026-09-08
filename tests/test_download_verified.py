@@ -4,23 +4,38 @@ Uses a local ThreadingHTTPServer (no external network) that can be configured
 per test to exercise the full range of resume / restart / verify behavior.
 """
 
+import errno
 import http.server
 import json
+import logging
 import socket
 import threading
+import time
 from contextlib import suppress
 from pathlib import Path
 
 import pytest
 import requests
+import urllib3.connection
 
 import media_archive_sync.downloader as downloader
 from media_archive_sync import (
     TimeoutPolicy,
     VerifiedDownload,
+    download_file,
+    download_files,
     download_verified,
 )
-from media_archive_sync.downloader import _StagingFileChangedError
+from media_archive_sync.downloader import (
+    URLPolicyError,
+    _check_peer,
+    _install_peer_check,
+    _peer_checked_connection,
+    _PeerCheckedHTTPAdapter,
+    _read_body,
+    _record_identity,
+    _StagingFileChangedError,
+)
 
 # 1000-byte deterministic body.
 BODY_1000 = bytes(range(256)) * 4
@@ -55,6 +70,8 @@ class _BaseHandler(http.server.BaseHTTPRequestHandler):
     _get_no_identity = False
     _get_count = 0
     _lock = threading.Lock()
+    _rotating_206_etag = False
+    _always_206 = False
 
     def log_message(self, *_args):
         pass
@@ -136,8 +153,15 @@ class _BaseHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        if range_hdr and not cls._ignore_range:
-            start = int(range_hdr.split("=", 1)[1].split("-")[0])
+        # F-D: always_206 answers every GET as a 206 (from a Range header, or
+        # from zero when absent) so the 206 conflict-restart branch is the one
+        # under test; combined with rotating_206_etag it models a rebinding
+        # server that rotates identity on every ranged response.
+        effective_range = range_hdr
+        if effective_range is None and cls._always_206:
+            effective_range = "bytes=0-"
+        if effective_range and not cls._ignore_range:
+            start = int(effective_range.split("=", 1)[1].split("-")[0])
             body = content[start:]
             reported_start = start if not cls._wrong_range_start else max(0, start - 1)
             reported_total = total if not cls._wrong_range_total else total + 1
@@ -148,7 +172,11 @@ class _BaseHandler(http.server.BaseHTTPRequestHandler):
             )
             self.send_header("Content-Length", str(len(body)))
             if not cls._get_no_identity:
-                self.send_header("ETag", cls._etag)
+                # F-D: a server rotating its ETag on every 206 forces a
+                # conflict-restart on every GET. Only meaningful with the
+                # rotating_206_etag toggle; reuses the GET-tick counter.
+                etag = f'"r{cls._get_count}"' if cls._rotating_206_etag else cls._etag
+                self.send_header("ETag", etag)
                 self.send_header("Last-Modified", cls._last_modified)
             self.end_headers()
             self.wfile.write(body[:abort_bytes])
@@ -306,7 +334,11 @@ def test_new_download_success_and_identity_persisted(
     with local_http_server() as srv:
         staging = tmp_path / "media.mp4.partial"
         result = download_verified(
-            srv.url(), staging, expected_size=1000, timeout=fast_policy
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
         )
         assert result.ok
         assert isinstance(result, VerifiedDownload)
@@ -343,6 +375,7 @@ def test_range_resume_appends_and_verifies(tmp_path, fast_policy, local_http_ser
             expected_size=1000,
             timeout=fast_policy,
             progress=lambda d, t: progress.append((d, t)),
+            allow_local=True,
         )
         assert result.ok
         assert result.resumed is True
@@ -364,7 +397,11 @@ def test_server_ignores_range_restarts_from_zero(
         sidecar = staging.with_name(staging.name + ".identity.json")
         _seed_partial(staging, sidecar, BODY_1000, offset=400, length=1000, etag='"v1"')
         result = download_verified(
-            srv.url(), staging, expected_size=1000, timeout=fast_policy
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
         )
         assert result.ok
         # Range was ignored (200), so it restarted from byte zero.
@@ -383,7 +420,11 @@ def test_incorrect_content_range_start_restarts(
         sidecar = staging.with_name(staging.name + ".identity.json")
         _seed_partial(staging, sidecar, BODY_1000, offset=400, length=1000, etag='"v1"')
         result = download_verified(
-            srv.url(), staging, expected_size=1000, timeout=fast_policy
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
         )
         assert result.ok
         assert result.resumed is False
@@ -398,7 +439,11 @@ def test_wrong_content_range_total_restarts(tmp_path, fast_policy, local_http_se
         sidecar = staging.with_name(staging.name + ".identity.json")
         _seed_partial(staging, sidecar, BODY_1000, offset=400, length=1000, etag='"v1"')
         result = download_verified(
-            srv.url(), staging, expected_size=1000, timeout=fast_policy
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
         )
         assert result.ok
         assert result.resumed is False
@@ -427,7 +472,11 @@ def test_remote_size_changed_discards_partial(tmp_path, fast_policy, local_http_
             )
         )
         result = download_verified(
-            srv.url(), staging, expected_size=None, timeout=fast_policy
+            srv.url(),
+            staging,
+            expected_size=None,
+            timeout=fast_policy,
+            allow_local=True,
         )
         assert result.ok
         # The 400-byte old partial was discarded; re-downloaded from zero.
@@ -447,7 +496,11 @@ def test_etag_flip_discards_partial(tmp_path, fast_policy, local_http_server):
         # The remote's identity has since flipped to a new ETag.
         srv.flip_etag('"v2"')
         result = download_verified(
-            srv.url(), staging, expected_size=1000, timeout=fast_policy
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
         )
         assert result.ok
         # ETag changed from the recorded value: partial discarded, restarted.
@@ -468,7 +521,11 @@ def test_expected_size_mismatch_reports_sizemismatch(
     with local_http_server(content=short) as srv:
         staging = tmp_path / "media.mp4.partial"
         result = download_verified(
-            srv.url(), staging, expected_size=1000, timeout=fast_policy
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
         )
         assert result.ok is False
         assert result.error_class == "SizeMismatch"
@@ -484,7 +541,11 @@ def test_staged_partial_never_renamed(tmp_path, fast_policy, local_http_server):
         staging = tmp_path / "clip.mkv.partial"
         final_name_candidate = staging.with_name(staging.name.replace(".partial", ""))
         result = download_verified(
-            srv.url(), staging, expected_size=1000, timeout=fast_policy
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
         )
         assert result.ok
         # The .partial file is the final path; no rename to a media path.
@@ -502,7 +563,11 @@ def test_identity_manifest_default_and_custom_location(
         # Default location: <staging>.identity.json
         default_staging = tmp_path / "a.mp4.partial"
         download_verified(
-            srv.url(), default_staging, expected_size=1000, timeout=fast_policy
+            srv.url(),
+            default_staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
         )
         assert (default_staging.with_name("a.mp4.partial.identity.json")).is_file()
 
@@ -515,6 +580,7 @@ def test_identity_manifest_default_and_custom_location(
             expected_size=1000,
             timeout=fast_policy,
             identity_manifest_path=custom,
+            allow_local=True,
         )
         assert result.ok
         assert custom.is_file()
@@ -540,6 +606,7 @@ def test_mid_body_abort_retries_with_backoff_and_resumes(
             expected_size=1000,
             timeout=fast_policy,
             progress=lambda d, t: progress.append((d, t)),
+            allow_local=True,
         )
         assert result.ok
         # The final read appended to the (extended) partial: a resume.
@@ -569,7 +636,11 @@ def test_head_failure_reports_retries_exhausted_without_raising(
     with local_http_server(status=500) as srv:
         staging = tmp_path / "media.mp4.partial"
         result = download_verified(
-            srv.url(), staging, expected_size=1000, timeout=fast_policy
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
         )
         assert result.ok is False
         # F6: exhaustion reports the sentinel class, carrying the last
@@ -605,7 +676,11 @@ def test_get_identity_mismatch_restarts_and_stays_correct(
             staging, sidecar, new_content, offset=400, length=1000, etag='"v1"'
         )
         result = download_verified(
-            srv.url(), staging, expected_size=1000, timeout=fast_policy
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
         )
         assert result.ok
         # The 206 carried the new ETag: partial discarded, restarted from zero.
@@ -641,7 +716,11 @@ def test_resume_without_persisted_validator_restarts(
             )
         )
         result = download_verified(
-            srv.url(), staging, expected_size=1000, timeout=fast_policy
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
         )
         assert result.ok
         assert result.resumed is False
@@ -670,7 +749,11 @@ def test_complete_manifest_with_truncated_partial_discards(
             complete=True,
         )
         result = download_verified(
-            srv.url(), staging, expected_size=1000, timeout=fast_policy
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
         )
         assert result.ok
         assert result.resumed is False
@@ -689,7 +772,11 @@ def test_size_mismatch_failure_leaves_manifest_incomplete(
     with local_http_server(content=short) as srv:
         staging = tmp_path / "media.mp4.partial"
         result = download_verified(
-            srv.url(), staging, expected_size=1000, timeout=fast_policy
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
         )
         assert result.ok is False
         assert result.error_class == "SizeMismatch"
@@ -709,7 +796,11 @@ def test_non_numeric_content_length_fails_structurally(
     with local_http_server(broken_get_content_length=True) as srv:
         staging = tmp_path / "media.mp4.partial"
         result = download_verified(
-            srv.url(), staging, expected_size=None, timeout=fast_policy
+            srv.url(),
+            staging,
+            expected_size=None,
+            timeout=fast_policy,
+            allow_local=True,
         )
         assert result.ok is False
         # Structured, not raised: a non-None error class is reported.
@@ -727,7 +818,11 @@ def test_redirect_to_loopback_rejected(tmp_path, fast_policy, local_http_server)
         srv.set_redirect(f"http://127.0.0.1:{srv.port}/elsewhere")
         staging = tmp_path / "media.mp4.partial"
         result = download_verified(
-            srv.url(), staging, expected_size=1000, timeout=fast_policy
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
         )
         assert result.ok is False
         assert result.error_class is not None
@@ -789,7 +884,11 @@ def test_range_416_reports_range_not_satisfiable(
             )
         )
         result = download_verified(
-            srv.url(), staging, expected_size=None, timeout=fast_policy
+            srv.url(),
+            staging,
+            expected_size=None,
+            timeout=fast_policy,
+            allow_local=True,
         )
         assert result.ok is False
         assert result.error_class == "RangeNotSatisfiable"
@@ -828,7 +927,11 @@ def test_redirect_to_private_ip_rejected(tmp_path, fast_policy, local_http_serve
         srv.set_redirect("http://192.168.1.1/x")
         staging = tmp_path / "media.mp4.partial"
         result = download_verified(
-            srv.url(), staging, expected_size=1000, timeout=fast_policy
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
         )
         assert result.ok is False
         assert result.error_class is not None
@@ -849,7 +952,11 @@ def test_remote_shrunk_to_partial_length_discards(
         sidecar = staging.with_name(staging.name + ".identity.json")
         _seed_partial(staging, sidecar, short, offset=600, length=1000, etag='"v1"')
         result = download_verified(
-            srv.url(), staging, expected_size=None, timeout=fast_policy
+            srv.url(),
+            staging,
+            expected_size=None,
+            timeout=fast_policy,
+            allow_local=True,
         )
         assert result.ok
         assert result.resumed is False
@@ -871,7 +978,11 @@ def test_recorded_validator_missing_from_current_head_discards(
         sidecar = staging.with_name(staging.name + ".identity.json")
         _seed_partial(staging, sidecar, BODY_1000, offset=400, length=1000, etag='"v1"')
         result = download_verified(
-            srv.url(), staging, expected_size=1000, timeout=fast_policy
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
         )
         assert result.ok
         assert result.resumed is False
@@ -889,7 +1000,11 @@ def test_get_without_identity_headers_resumes(tmp_path, fast_policy, local_http_
         sidecar = staging.with_name(staging.name + ".identity.json")
         _seed_partial(staging, sidecar, BODY_1000, offset=400, length=1000, etag='"v1"')
         result = download_verified(
-            srv.url(), staging, expected_size=1000, timeout=fast_policy
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
         )
         assert result.ok
         assert result.resumed is True
@@ -934,7 +1049,11 @@ def test_staging_changed_mid_append_recovers(
 
         monkeypatch.setattr(downloader, "_read_body", _raising_read)
         result = download_verified(
-            srv.url(), staging, expected_size=1000, timeout=fast_policy
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
         )
         assert result.ok
         # First append was refused, then a clean restart from zero succeeded.
@@ -960,6 +1079,7 @@ def test_caller_provided_session_honored(tmp_path, fast_policy, local_http_serve
                 expected_size=1000,
                 timeout=fast_policy,
                 session=session,
+                allow_local=True,
             )
             assert result.ok
             assert result.resumed is False
@@ -982,7 +1102,11 @@ def test_head_non_numeric_content_length_falls_back(
     with local_http_server(head_content_length="not-a-number") as srv:
         staging = tmp_path / "media.mp4.partial"
         result = download_verified(
-            srv.url(), staging, expected_size=None, timeout=fast_policy
+            srv.url(),
+            staging,
+            expected_size=None,
+            timeout=fast_policy,
+            allow_local=True,
         )
         assert result.ok
         assert result.resumed is False
@@ -1012,7 +1136,11 @@ def test_corrupt_identity_sidecar_treated_as_missing(
             )
             sidecar.write_text(payload)
             result = download_verified(
-                srv.url(), staging, expected_size=1000, timeout=fast_policy
+                srv.url(),
+                staging,
+                expected_size=1000,
+                timeout=fast_policy,
+                allow_local=True,
             )
             assert result.ok, payload
             assert result.resumed is False, payload
@@ -1020,3 +1148,453 @@ def test_corrupt_identity_sidecar_treated_as_missing(
             assert staging.read_bytes() == BODY_1000, payload
             # A fresh, valid sidecar was written by the successful download.
             assert _manifest(staging)["complete"] is True
+
+
+# --- PR #9 follow-up regression tests (F-A..F-F) ---------------------------
+
+
+def test_default_rejects_loopback_initial_url(tmp_path, fast_policy, local_http_server):
+    # F-A: the default (allow_local=False) must reject a loopback INITIAL URL
+    # with a structured URLPolicyError failure — the pre-connect check runs
+    # before any request, so no retry is burned and nothing is written.
+    with local_http_server() as srv:
+        staging = tmp_path / "media.mp4.partial"
+        result = download_verified(
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+        )
+        assert result.ok is False
+        assert result.error_class == "URLPolicyError"
+        assert result.error_message is not None
+        # Nothing was created: the policy gate fails before any mkdir/IO.
+        assert not staging.parent.joinpath(staging.name).exists()
+        assert result.final_path is None
+        assert result.bytes_downloaded == 0
+
+
+def test_download_file_cli_path_rejects_loopback_structured(
+    tmp_path, local_http_server, caplog
+):
+    # G1: the legacy CLI path (download_file with its own session) installs
+    # the strict SSRF guards, so a loopback URL fails the (bool, int) contract
+    # — no exception escapes and the policy rejection is logged.
+    with local_http_server() as srv:
+        local_path = tmp_path / "video.mp4"
+        with caplog.at_level(logging.WARNING, logger="media_archive_sync.downloader"):
+            result = download_file(srv.url(), local_path)
+        assert result == (False, 0)
+        assert not local_path.exists()
+        assert not (local_path.with_suffix(local_path.suffix + ".partial")).exists()
+        # The policy rejection is observable: download_file logs "Download
+        # failed for <url>: <exc>" at WARNING, and the peer guard names the
+        # offending peer in the message.
+        failed = [r for r in caplog.records if "Download failed" in r.getMessage()]
+        assert any(
+            "127.0.0.1" in r.getMessage() for r in failed
+        ), "expected the policy rejection to be logged"
+
+
+def test_download_files_cli_path_rejects_loopback_structured(
+    tmp_path, local_http_server
+):
+    # G1: the parallel worker path (download_files) enforces the same strict
+    # policy; a loopback URL counts as a failure, and no exception escapes.
+    with local_http_server() as srv:
+        local_path = tmp_path / "video.mp4"
+        result = download_files([(srv.url(), local_path)], workers=1)
+        success, _skipped, failed, paths = result
+        assert success == 0
+        assert failed == 1
+        assert paths == []
+        assert not local_path.exists()
+
+
+def test_peer_guard_rejects_loopback_at_connect(tmp_path, local_http_server):
+    # F-B: unit-test the guarded connection directly. A strict guard (empty
+    # allow-local set) connecting to the local test server (peer 127.0.0.1)
+    # must raise URLPolicyError AT CONNECT TIME, with the socket closed —
+    # this is the DNS-rebinding proof: the pre-connect check is bypassed by
+    # connecting to a raw IP, and only the peer check catches it.
+    with local_http_server() as srv:
+        strict = _peer_checked_connection(
+            urllib3.connection.HTTPConnection, frozenset()
+        )
+        conn = strict("127.0.0.1", srv.port)
+        with pytest.raises(URLPolicyError):
+            conn.connect()
+        # The socket was closed on rejection (fileno -1 / no live fd).
+        sock = conn.sock
+        assert sock is None or sock.fileno() == -1
+
+
+def test_peer_guard_adapter_unwraps_policy_error_end_to_end(
+    local_http_server, monkeypatch
+):
+    # G2: drive a real request through the peer-checked adapter mounted on a
+    # real requests.Session. The pre-connect _assert_public_url is bypassed by
+    # pointing the session straight at the loopback server (as a rebinding
+    # attacker's TCP peer would be after DNS flips). The peer guard must
+    # reject the actual peer, and the adapter must re-raise the ORIGINAL
+    # URLPolicyError (not a wrapped ConnectionError) so the structured failure
+    # identity survives end-to-end. The socket must be closed on rejection.
+    with local_http_server() as srv:
+        session = requests.Session()
+        _install_peer_check(session, frozenset())
+
+        captured: dict = {}
+        real_check_peer = downloader._check_peer
+
+        def _spy(conn):
+            captured["conn"] = conn
+            captured["sock"] = getattr(conn, "sock", None)
+            real_check_peer(conn)
+
+        monkeypatch.setattr(downloader, "_check_peer", _spy)
+
+        with pytest.raises(URLPolicyError) as exc_info:
+            session.get(srv.url(), timeout=5)
+
+        raised = exc_info.value
+        assert isinstance(raised, URLPolicyError)
+        # The unwrap preserves identity: it is URLPolicyError ITSELF, and
+        # nothing urllib3 wrapped it into a plain ConnectionError.
+        assert not isinstance(raised, requests.exceptions.ConnectionError)
+        assert "127.0.0.1" in str(raised)
+        # The socket held by the guarded connection was closed on rejection
+        # (fileno -1 / no live fd).
+        sock = captured.get("sock")
+        assert sock is not None
+        assert sock.fileno() == -1
+        # And the guarded connection itself reports no live socket.
+        conn = captured.get("conn")
+        assert getattr(conn, "sock", None) is None
+
+
+def test_peer_guard_allows_local_when_host_listed(tmp_path, local_http_server):
+    # F-B: with the initial host in the allow-local set, the same guarded
+    # connection to the loopback server succeeds.
+    with local_http_server() as srv:
+        allowed = _peer_checked_connection(
+            urllib3.connection.HTTPConnection,
+            frozenset({"127.0.0.1"}),
+        )
+        conn = allowed("127.0.0.1", srv.port)
+        try:
+            conn.connect()
+            assert conn.sock is not None
+            assert conn.sock.getpeername()[0] == "127.0.0.1"
+        finally:
+            with suppress(OSError):
+                conn.close()
+
+
+def test_final_manifest_write_failure_is_structured(
+    tmp_path, fast_policy, local_http_server, monkeypatch
+):
+    # F-C: the final _record_identity(..., complete=True) write raises OSError.
+    # The bytes are complete and verified in staging; the failure must be a
+    # structured outcome (ok False, error OSError, final_path=staging,
+    # ok_bytes=full size), never a raised exception.
+    with local_http_server() as srv:
+        staging = tmp_path / "media.mp4.partial"
+        manifest = staging.with_name(staging.name + ".identity.json")
+
+        def _boom(path, identity, *, complete):
+            if complete:
+                raise OSError("simulated final manifest write failure")
+            _record_identity(path, identity, complete=complete)
+
+        monkeypatch.setattr(downloader, "_record_identity", _boom)
+        result = download_verified(
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
+        )
+        assert result.ok is False
+        assert result.error_class == "OSError"
+        assert result.error_message is not None
+        assert result.final_path == staging
+        assert result.bytes_downloaded == 1000
+        # The verified bytes remain in the staging file for the caller.
+        assert staging.read_bytes() == BODY_1000
+        # The complete mark never landed (only the in-attempt incomplete writes
+        # via the original helper ran).
+        if manifest.exists():
+            assert _manifest(staging)["complete"] is False
+
+
+def test_rotating_206_etag_terminates_structured(tmp_path, local_http_server):
+    # F-D(a): a server rotating its ETag on every 206 must not force an
+    # unbounded restart loop. The pre-fix inner `while True` would restart
+    # forever on the 206 conflict-restart branch; now the per-pass restart
+    # budget raises IdentityConflictError so each pass consumes one retry
+    # attempt, and the bounded retry budget terminates the download FAST as
+    # a structured RetriesExhausted failure.
+    #
+    # The restart budget is only reachable on the 206 conflict branch: a
+    # conflicting fresh 200 is adopted and succeeds (see the sibling test).
+    # We seed a partial so every GET is a 206, and we keep the 206 path
+    # conflict-forcing: every 206 carries a fresh, HEAD-contradicting ETag.
+    # always_206 keeps every GET a 206 (a 200 would be adopted and succeed),
+    # so the bounded 206 conflict-restart branch is exercised every pass.
+    fast = TimeoutPolicy(
+        connect_seconds=5, read_seconds=30, retry_attempts=2, backoff_seconds=0.0
+    )
+    with local_http_server(rotating_206_etag=True, always_206=True) as srv:
+        staging = tmp_path / "media.mp4.partial"
+        sidecar = staging.with_name(staging.name + ".identity.json")
+        _seed_partial(staging, sidecar, BODY_1000, offset=400, length=1000, etag='"v1"')
+        start = time.monotonic()
+        result = download_verified(
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast,
+            allow_local=True,
+        )
+        elapsed = time.monotonic() - start
+        assert result.ok is False
+        assert result.error_class == "RetriesExhausted"
+        assert result.error_message is not None
+        # Error-propagation contract: the bounded conflict restarts surface
+        # their cause — IdentityConflictError — in the RetriesExhausted
+        # message, so the exhaustion names the conflict, not just "failed".
+        assert "IdentityConflictError" in result.error_message
+        # Must terminate quickly: bounded retries + restart budget, no loop.
+        assert elapsed < 5.0
+
+
+def test_conflicting_full_200_adopts_served_identity(
+    tmp_path, fast_policy, local_http_server
+):
+    # F-D(b): fresh start (partial 0), HEAD reports etag v1, but the GET 200
+    # carries etag v2. A conflicting full 200 with an empty partial must be
+    # adopted and consumed as-is: success, correct content, and the outcome's
+    # remote_identity carries the adopted etag v2.
+    with local_http_server(etag='"v2"', head_etag='"v1"') as srv:
+        staging = tmp_path / "media.mp4.partial"
+        result = download_verified(
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
+        )
+        assert result.ok
+        assert result.bytes_downloaded == 1000
+        assert result.resumed is False
+        assert staging.read_bytes() == BODY_1000
+        assert result.remote_identity is not None
+        assert result.remote_identity["etag"] == '"v2"'
+        assert _manifest(staging)["etag"] == '"v2"'
+
+
+class _FakeResponse:
+    """Minimal stand-in for a streamed requests.Response body."""
+
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def iter_content(self, chunk_size: int):
+        for i in range(0, len(self._body), chunk_size):
+            yield self._body[i : i + chunk_size]
+
+    @property
+    def headers(self) -> dict:
+        return {"Content-Length": str(len(self._body))}
+
+
+def test_staging_leaf_symlink_rejected_at_open(tmp_path):
+    # F-F: a fresh symlink created where the staging leaf sits must be refused
+    # at open time by O_NOFOLLOW. The is_symlink pre-check is the primary
+    # gate when download_root is set; O_NOFOLLOW in _read_body is the
+    # open-time backstop. We point the staging path at a symlink whose target
+    # is an existing real file; a direct open() with O_NOFOLLOW must fail
+    # with ELOOP, proving the open site refuses the leaf symlink.
+    real = tmp_path / "real_target.bin"
+    real.write_bytes(b"0" * 8)
+    leaf = tmp_path / "media.mp4.partial"
+    leaf.symlink_to(real)
+    assert leaf.is_symlink()
+    with pytest.raises(OSError) as excinfo:
+        _read_body(
+            _FakeResponse(BODY_1000),
+            leaf,
+            "wb",
+            base=0,
+            chunk_size=8192,
+            progress=None,
+            expected_size=1000,
+        )
+    # ELOOP (looping symlink) is the OS refusal for O_NOFOLLOW open of a
+    # symlink; the key property is an OSError raised at open time, not a
+    # write through the link.
+    assert excinfo.value.errno in (errno.ELOOP, errno.EISDIR)
+    # The link target was NOT overwritten through the symlink.
+    assert real.read_bytes() == b"0" * 8
+
+
+def test_manifest_tmp_sibling_symlink_rejected(tmp_path):
+    # P1: a symlink planted at the identity manifest's tmp-sibling path
+    # (<manifest>.identity.json.tmp) must be refused at open time by
+    # O_NOFOLLOW in _record_identity. The tmp-sibling write is the only site
+    # that follows the tmp path, so a leaf swap there would let a local
+    # attacker write through the link; the O_NOFOLLOW open must fail with
+    # ELOOP instead, leaving the target untouched and the manifest
+    # un-replaced.
+    manifest = tmp_path / "media.mp4.partial.identity.json"
+    manifest.write_text('{"complete": false}\n')
+    real = tmp_path / "real_target.bin"
+    real.write_bytes(b"PRECIOUS")
+    # The exact tmp-sibling naming _record_identity derives:
+    # path.with_suffix(path.suffix + ".tmp").
+    tmp_sibling = manifest.with_suffix(manifest.suffix + ".tmp")
+    assert tmp_sibling.name == "media.mp4.partial.identity.json.tmp"
+    tmp_sibling.symlink_to(real)
+    assert tmp_sibling.is_symlink()
+    with pytest.raises(OSError) as excinfo:
+        _record_identity(
+            manifest,
+            {"content_length": 1000, "etag": '"v1"'},
+            complete=True,
+        )
+    # The OS refused the O_NOFOLLOW open of the symlink.
+    assert excinfo.value.errno in (errno.ELOOP, errno.EISDIR)
+    # The link target was NOT written through the symlink.
+    assert real.read_bytes() == b"PRECIOUS"
+    # The manifest itself was NOT replaced (the tmp write failed first).
+    assert manifest.read_text() == '{"complete": false}\n'
+
+
+def test_download_file_caller_session_rejects_loopback_and_stays_open(
+    tmp_path, local_http_server, caplog
+):
+    # P1: like the own-session path (G1), a caller-supplied session is
+    # opted into the strict SSRF guards, so a loopback URL fails the
+    # (bool, int) contract with the policy rejection logged. The caller
+    # session is NOT closed by download_file: a follow-up request on it is
+    # still serviced by the (now-installed) peer guard — which rejects the
+    # loopback peer with URLPolicyError, proving the session is alive and
+    # the guards are mounted (a closed/abandoned session would fail a
+    # different way).
+    with local_http_server() as srv:
+        local_path = tmp_path / "video.mp4"
+        session = requests.Session()
+        try:
+            with caplog.at_level(
+                logging.WARNING, logger="media_archive_sync.downloader"
+            ):
+                result = download_file(srv.url(), local_path, session=session)
+            assert result == (False, 0)
+            # No partial or final file was written.
+            assert not local_path.exists()
+            assert not (local_path.with_suffix(local_path.suffix + ".partial")).exists()
+            # The policy rejection is observable: download_file logs
+            # "Download failed for <url>: <exc>" at WARNING, and the peer
+            # guard names the offending peer.
+            failed = [r for r in caplog.records if "Download failed" in r.getMessage()]
+            assert any(
+                "127.0.0.1" in r.getMessage() for r in failed
+            ), "expected the policy rejection to be logged"
+            # Caller-owned: the session is still usable afterward. A
+            # follow-up request is serviced by the mounted peer guard,
+            # which rejects the loopback peer with the ORIGINAL
+            # URLPolicyError (not a plain ConnectionError).
+            follow_up_error: BaseException | None = None
+            try:
+                session.get(srv.url(), timeout=5)
+            except BaseException as exc:
+                follow_up_error = exc
+            assert isinstance(follow_up_error, URLPolicyError), (
+                f"expected the live session's peer guard to reject the "
+                f"follow-up loopback request, got {follow_up_error!r}"
+            )
+        finally:
+            session.close()
+
+
+def test_check_peer_unparseable_peer_fails_closed():
+    # P1: an unparseable getpeername() (a resolver/peer that returns
+    # something ip_address cannot parse) must FAIL CLOSED for every
+    # non-allowed host: URLPolicyError raised and the socket closed —
+    # never a silent pass. Unit-test _check_peer directly with a guarded
+    # connection (empty allowed set) and a stub sock.
+    strict = _peer_checked_connection(urllib3.connection.HTTPConnection, frozenset())
+    conn = strict("example.com", 80)
+
+    class _FakeSock:
+        """Minimal sock stand-in: records close(), returns a fixed peer."""
+
+        def __init__(self, peer: str) -> None:
+            self._peer = peer
+            self.closed = False
+
+        def getpeername(self) -> tuple[str, int]:
+            return (self._peer, 41337)
+
+        def close(self) -> None:
+            self.closed = True
+
+    # "256.256.256.256" makes ip_address raise ValueError.
+    sock = _FakeSock("256.256.256.256")
+    conn.sock = sock
+    with pytest.raises(URLPolicyError):
+        _check_peer(conn)
+    # The socket was closed on the fail-closed rejection.
+    assert sock.closed is True
+
+
+def test_read_body_append_mode_symlink_rejected(tmp_path):
+    # P2: the O_NOFOLLOW backstop must also fire in APPEND mode ("ab"),
+    # not just "wb": a symlink swapped in at the staging leaf is refused
+    # at open time with ELOOP, and the link target is not written through.
+    # (Mirrors test_staging_leaf_symlink_rejected_at_open for the append
+    # path; base=0 matches an empty target so the size guard passes and
+    # the open is what must fail.)
+    real = tmp_path / "real_target.bin"
+    real.write_bytes(b"")
+    leaf = tmp_path / "media.mp4.partial"
+    leaf.symlink_to(real)
+    assert leaf.is_symlink()
+    with pytest.raises(OSError) as excinfo:
+        _read_body(
+            _FakeResponse(BODY_1000),
+            leaf,
+            "ab",
+            base=0,
+            chunk_size=8192,
+            progress=None,
+            expected_size=1000,
+        )
+    # ELOOP: the O_NOFOLLOW open of the symlink is refused at open time.
+    assert excinfo.value.errno in (errno.ELOOP, errno.EISDIR)
+    # The link target was NOT appended to through the symlink.
+    assert real.read_bytes() == b""
+
+
+def test_peer_adapter_send_reraises_plain_connection_error(monkeypatch):
+    # P2: the adapter's ConnectionError unwrap must only re-raise
+    # URLPolicyError when the cause/context chain actually carries one. A
+    # plain transport ConnectionError (timeout, RST, ...) that carries NO
+    # URLPolicyError must escape unchanged, so ordinary failures stay
+    # ordinary and keep their identity.
+    adapter = _PeerCheckedHTTPAdapter(frozenset())
+    plain = requests.exceptions.ConnectionError("plain transport failure")
+    calls = 0
+
+    def _plain_send(self, request, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise plain
+
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", _plain_send)
+    with pytest.raises(requests.exceptions.ConnectionError) as excinfo:
+        adapter.send(requests.PreparedRequest())
+    # The SAME exception object escaped (identity, not just shape): the
+    # unwrap did not wrap, re-type, or replace an ordinary failure.
+    assert excinfo.value is plain
+    assert calls == 1

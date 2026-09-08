@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import functools
 import json
+import os
 import signal
 import socket
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from ipaddress import IPv4Address, IPv6Address, ip_address
 from pathlib import Path
@@ -24,6 +26,8 @@ from typing import Any, Literal
 from urllib.parse import urljoin, urlparse
 
 import requests
+import urllib3.connection
+import urllib3.connectionpool
 from requests.adapters import HTTPAdapter
 
 from .config import ArchiveConfig
@@ -52,6 +56,22 @@ class URLPolicyError(requests.RequestException):
 
     Raised as a subclass of :class:`requests.RequestException` so callers
     treat it as a normal network failure.
+    """
+
+    pass
+
+
+class IdentityConflictError(requests.RequestException):
+    """Identity conflicts persist past the restart budget for one pass.
+
+    Raised by :func:`_verified_attempt` after the same HEAD/GET identity
+    conflict forces more restarts than :data:`_MAX_IDENTITY_CONFLICT_RESTARTS`
+    allows (a server rotating ETag/Last-Modified on every 206 would otherwise
+    restart forever, bypassing the retry budget). It is a
+    :class:`requests.RequestException` subclass so the per-attempt handler in
+    :func:`download_verified` consumes a retry attempt and reports a structured
+    :class:`~.VerifiedDownload` failure instead of an endless loop. Internal;
+    not exported from the package.
     """
 
     pass
@@ -113,9 +133,21 @@ def _assert_public_url(url: str, *, allow_local: bool = False) -> None:
 
 
 def _url_policy_hook(
-    response: requests.Response, **_kwargs: object
+    response: requests.Response,
+    *,
+    allow_local: bool = False,
+    **_kwargs: object,
 ) -> requests.Response:
     """Session hook: validate each fetched URL and redirect target.
+
+    This hook is defense-in-depth for redirect ``Location`` targets and the
+    fetched response URL. The primary SSRF barrier is the connection-time
+    peer guard (see :func:`_install_peer_check`), which checks the actual TCP
+    peer on every connect, so a rebinding resolver cannot bypass the policy.
+    The hook cannot see the resolved peer, so it complements — not replaces —
+    that guard: a redirect to an internal *host* is still caught here even
+    though the guard would reject it at connect time, and it re-validates the
+    fetched URL after each hop.
 
     Runs after every response — including each redirect hop, which is a
     separate request through this same session (verified empirically:
@@ -126,21 +158,19 @@ def _url_policy_hook(
     response URL, via :func:`urllib.parse.urljoin`.
 
     Trust split: the response to the *initial* request is checked with
-    ``allow_local=True`` — that address is the operator-chosen initial
-    URL (approved with that trust by the caller). Every response after
-    the first was fetched at a redirect target, so its URL is checked
-    strictly (the rebinding window between the operator's check and the
-    hop's connect stays closed). The Location target of any redirect is
-    always checked strictly: the operator never chose redirect targets,
-    so a server must never bounce the download to an internal address.
+    ``allow_local`` — that address is the operator-chosen initial URL, and the
+    caller's ``allow_local`` decision applies to it. Every response after the
+    first was fetched at a redirect target, so its URL is checked strictly:
+    the operator never chose redirect targets, so a server must never bounce
+    the download to an internal address.
     """
     if response.url:
         # Post-redirect responses were fetched at a Location target:
         # strictly public-only. Only the very first response (no history)
-        # may be the operator-chosen local URL.
+        # may be the operator-chosen local URL (per allow_local).
         _assert_public_url(
             response.url,
-            allow_local=(len(response.history) == 0),
+            allow_local=(len(response.history) == 0) and allow_local,
         )
     if response.is_redirect:
         location = response.headers.get("Location")
@@ -149,17 +179,174 @@ def _url_policy_hook(
     return response
 
 
-def _install_url_policy(session: requests.Session) -> None:
-    """Register the redirect policy hook on ``session`` (idempotent)."""
+def _install_url_policy(session: requests.Session, allow_local: bool = False) -> None:
+    """Register the redirect policy hook on ``session`` (idempotent).
+
+    ``allow_local`` is bound to the hook so the first (operator-chosen)
+    response is checked with the caller's local-access decision; redirect
+    hops are always checked strictly regardless.
+    """
     if getattr(session, "_mas_url_policy_installed", False):
         return
     session.hooks = {
         "response": [
             *(session.hooks.get("response", ())),
-            _url_policy_hook,
+            functools.partial(_url_policy_hook, allow_local=allow_local),
         ]
     }
     session._mas_url_policy_installed = True  # type: ignore[attr-defined]
+
+
+def _check_peer(conn: object) -> None:
+    """Reject a connected socket whose TCP peer violates the fetch policy.
+
+    The actual peer is the source of truth, so a rebinding resolver (which
+    passes the pre-connect :func:`_assert_public_url` but then serves an
+    internal address for the same hostname) cannot bypass the policy. Local
+    (private/loopback/link-local) peers are rejected unless the connection's
+    host is in the connection's ``_mas_allowed_local`` set (installed by
+    :func:`_peer_checked_connection`). Unparseable peers fail closed
+    (rejected) for every non-allowed host. ``conn`` is a urllib3 connection;
+    ``sock``/``host`` are read via ``getattr`` so this helper is independent
+    of the concrete class.
+    """
+    sock = getattr(conn, "sock", None)
+    host_attr = getattr(conn, "host", None)
+    allowed_obj: object = getattr(conn, "_mas_allowed_local", frozenset())
+    allowed = allowed_obj if isinstance(allowed_obj, frozenset) else frozenset()
+    if sock is None or host_attr is None:
+        return
+    host = str(host_attr).strip("[]").lower()
+    host_allowed = host in allowed
+    peer = sock.getpeername()[0]
+    try:
+        ip = ip_address(peer)
+    except ValueError:
+        if not host_allowed:
+            sock.close()
+            raise URLPolicyError(
+                f"Unparseable connect peer {peer!r} for {host}"
+            ) from None
+        return
+    if _is_disallowed_address(ip) and not (host_allowed and _is_local_address(ip)):
+        sock.close()
+        raise URLPolicyError(f"Connect peer {peer} for {host} is not allowed")
+
+
+def _peer_checked_connection(
+    base: type[urllib3.connection.HTTPConnection],
+    allowed: frozenset[str],
+) -> type[urllib3.connection.HTTPConnection]:
+    """A connection subclass of ``base`` that enforces the peer policy.
+
+    ``connect`` first runs ``base.connect`` (establishing ``self.sock``), then
+    validates the peer against the allowed-local set stored on the
+    connection. Built with ``base`` in scope so ``connect`` can call
+    ``base.connect(self)`` directly, keeping the guard mypy-checkable and
+    free of a separate mixin's ``super()``-in-isolation problem.
+    """
+
+    def _connect(self: urllib3.connection.HTTPConnection) -> None:
+        base.connect(self)
+        _check_peer(self)
+
+    return type(
+        f"_PeerChecked_{base.__name__}",
+        (base,),
+        {"_mas_allowed_local": allowed, "connect": _connect},
+    )
+
+
+class _PeerCheckedHTTPAdapter(HTTPAdapter):
+    """HTTPAdapter that mounts peer-checked connection classes.
+
+    On pool-manager init it replaces each pool's ``ConnectionCls`` with a
+    guarded subclass carrying the allowed-local set, so every TCP peer is
+    validated at connect time. It also unwraps a policy rejection: urllib3
+    re-wraps any error raised in ``connect`` into a ``ConnectionError``
+    (``requests.RequestException`` is an ``OSError``), so ``send`` walks the
+    cause/context chain and re-raises the original :class:`URLPolicyError` to
+    preserve the structured failure identity.
+    """
+
+    def __init__(self, allowed_local: frozenset[str]) -> None:
+        self._mas_allowed_local = allowed_local
+        super().__init__()
+
+    def init_poolmanager(
+        self, connections: int, maxsize: int, block: bool = False, **kwargs: object
+    ) -> None:
+        super().init_poolmanager(connections, maxsize, block, **kwargs)
+        # Replace the instance attribute, NOT the shared global: urllib3's
+        # PoolManager assigns the module-level pool_classes_by_scheme dict
+        # directly (no copy), so mutating it would leak the guard into every
+        # other session's PoolManager.
+        manager = self.poolmanager
+        manager.pool_classes_by_scheme = {
+            "http": type(
+                "_PeerCheckedHTTPPool",
+                (urllib3.connectionpool.HTTPConnectionPool,),
+                {
+                    "ConnectionCls": _peer_checked_connection(
+                        urllib3.connection.HTTPConnection,
+                        self._mas_allowed_local,
+                    )
+                },
+            ),
+            "https": type(
+                "_PeerCheckedHTTPSPool",
+                (urllib3.connectionpool.HTTPSConnectionPool,),
+                {
+                    "ConnectionCls": _peer_checked_connection(
+                        urllib3.connection.HTTPSConnection,
+                        self._mas_allowed_local,
+                    )
+                },
+            ),
+        }
+
+    def send(
+        self,
+        request: requests.PreparedRequest,
+        stream: bool = False,
+        timeout: float | tuple[float, float] | tuple[float, None] | None = None,
+        verify: bool | str = True,
+        cert: bytes | str | tuple[bytes | str, bytes | str] | None = None,
+        proxies: Mapping[str, str] | None = None,
+    ) -> requests.Response:
+        try:
+            return super().send(
+                request,
+                stream=stream,
+                timeout=timeout,
+                verify=verify,
+                cert=cert,
+                proxies=proxies,
+            )
+        except requests.exceptions.ConnectionError as exc:
+            current: BaseException | None = exc
+            seen: set[int] = set()
+            while current is not None and id(current) not in seen:
+                seen.add(id(current))
+                if isinstance(current, URLPolicyError):
+                    raise URLPolicyError(str(current)) from current
+                current = current.__cause__ or current.__context__
+            raise
+
+
+def _install_peer_check(
+    session: requests.Session, allowed_local: frozenset[str]
+) -> None:
+    """Mount the connection-time peer guard on ``session`` (http + https).
+
+    ``allowed_local`` is the set of hosts whose loopback/private/link-local
+    peers are permitted — by default empty (strict). Passing a caller session
+    in opts it into this guard as well as the :func:`_install_url_policy`
+    redirect hook.
+    """
+    adapter = _PeerCheckedHTTPAdapter(allowed_local)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
 
 
 # Default configuration values
@@ -167,6 +354,11 @@ DEFAULT_TIMEOUT = 15
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_BACKOFF = 2.0
 DEFAULT_CHUNK_SIZE = 8192
+# Maximum identity-conflict restarts within a single _verified_attempt pass.
+# Beyond this, a server rotating identity on every 206 would otherwise restart
+# forever, bypassing the retry budget, so we raise IdentityConflictError and
+# let the caller consume a retry attempt instead.
+_MAX_IDENTITY_CONFLICT_RESTARTS = 2
 
 
 def download_file(
@@ -283,6 +475,11 @@ def download_file(
         # The parameter is guaranteed non-None here: callers pass their own
         # session, or we created one above when it was None.
         assert session is not None
+        # SSRF guards (strict: no local addresses) on our own session and on
+        # any caller-provided one; both installs are idempotent. The
+        # connection-time peer guard is the primary barrier.
+        _install_peer_check(session, frozenset())
+        _install_url_policy(session)
         if own_session:
             with session:
                 return _do_download(session)
@@ -351,7 +548,13 @@ def _record_identity(path: Path, identity: dict, *, complete: bool) -> None:
         "complete": complete,
     }
     tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    # O_NOFOLLOW on the tmp sibling as well, so a symlink planted at the
+    # sibling path cannot be written through. Path.replace over the manifest
+    # is safe on POSIX: rename(2) replaces the symlink itself rather than
+    # following the final target component.
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, indent=2) + "\n")
     tmp_path.replace(path)
 
 
@@ -487,7 +690,16 @@ def _read_body(
     else:
         header_size = int(response.headers.get("Content-Length", -1) or -1)
         reported_total = base + header_size if header_size > 0 else -1
-    with open(staging_path, mode) as handle:
+    # O_NOFOLLOW refuses to open the staging path if it is a symlink, so a
+    # leaf-symlink swap between the confinement check and this open is denied
+    # at open time (the existing is_symlink pre-check is defense in depth).
+    open_flags = (
+        os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        if mode == "ab"
+        else os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    )
+    fd = os.open(staging_path, open_flags | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, mode) as handle:
         for chunk in response.iter_content(chunk_size=chunk_size):
             if chunk:
                 handle.write(chunk)
@@ -596,6 +808,15 @@ def _enforce_confinement(download_root: Path, *paths: Path) -> None:
     Symlinks are followed during resolution, so a path whose parent
     chain escapes the root (directly or through a symlinked directory)
     raises ValueError; this check runs before any mkdir/IO.
+
+    Residual window (accepted trade-off, partial F-F fix): validation-then-open
+    is still check-then-use for the PARENT directory chain. A local attacker
+    who swaps a parent directory for a symlink between this resolve() and the
+    subsequent open() is out of reach for portable stdlib (full closure needs
+    openat2/RESOLVE_NO_SYMLINKS, which is Linux-only). What IS closed: a
+    leaf-substitution race — a symlink swapped in at the staging/manifest
+    path itself after this check — is now refused at open time by
+    O_NOFOLLOW (see _read_body / _record_identity).
     """
     root = download_root.resolve()
     for path in paths:
@@ -631,19 +852,6 @@ def _verified_failure(
     )
 
 
-def _drain_response(response: requests.Response) -> None:
-    """Fully consume the body of a streamed response that is discarded.
-
-    Closing a streamed response without reading it leaves unread bytes
-    on the wire, which can desynchronize a pooled connection; draining
-    is bounded by the server's declared Content-Length/Content-Range.
-    Failures to drain are irrelevant (the body is being thrown away).
-    """
-    with contextlib.suppress(Exception):
-        for _chunk in response.iter_content(chunk_size=65536):
-            pass
-
-
 def _verified_attempt(
     session: requests.Session,
     url: str,
@@ -661,7 +869,22 @@ def _verified_attempt(
     unrecoverable. Connection errors propagate to the caller, which owns
     the retry/backoff budget. Range-not-honored cases are handled here
     (safe restart from byte zero) without consuming a retry attempt.
+
+    Identity-conflict restarts are bounded per pass: a 206 whose identity
+    contradicts the HEAD identity discards the partial and restarts, up to
+    :data:`_MAX_IDENTITY_CONFLICT_RESTARTS` times per pass; beyond that an
+    :class:`IdentityConflictError` propagates so the caller consumes a retry
+    attempt instead of restarting forever. A conflicting full 200 (which only
+    reaches this check with an empty partial) is adopted and consumed as-is,
+    not restarted.
+
+    Where a pass restarts (range-not-honored, identity conflict, or a
+    mid-append staging change) the already-open streamed response is closed
+    WITHOUT draining: an unread streamed response closes the underlying
+    connection rather than returning it dirty to the pool, so there is nothing
+    to drain (draining a full 200 would fetch the whole object for no reason).
     """
+    conflict_restarts = 0
     while True:
         partial_size = staging_path.stat().st_size if staging_path.is_file() else 0
         recorded = _verified_identity(manifest_path)
@@ -685,7 +908,7 @@ def _verified_attempt(
                     "Range resume not honored (%s); restarting",
                     response.status_code,
                 )
-                _drain_response(response)
+                # Close without draining (see docstring); then restart.
                 response.close()
                 staging_path.unlink(missing_ok=True)
                 continue
@@ -697,18 +920,44 @@ def _verified_attempt(
             if action == "read" and _get_identity_conflicts(response, current):
                 # The resume decision was based on the HEAD identity, but the
                 # GET may serve an object replaced in between (same length,
-                # different ETag/Last-Modified): appending that body would
-                # mix content while the final byte-count check still passes.
-                # Restart from zero; adopt the served identity so the retry
-                # does not conflict against the stale HEAD identity forever.
-                logger.warning(
-                    "GET identity conflicts with HEAD identity; restarting",
-                )
+                # different ETag/Last-Modified). Two cases:
+                #   * A conflicting full 200 can only reach this check with an
+                #     empty partial (the only case where a 200 is a "read"),
+                #     so it is written fresh with "wb". Adopt the served
+                #     identity and consume the body as-is: it is a complete
+                #     representation of the served object, and the final
+                #     byte-count check plus adopted identity keep the manifest
+                #     consistent.
+                #   * A conflicting 206 would be appended to the old partial,
+                #     mixing content while the final byte-count check still
+                #     passes. Discard the partial and restart from zero; adopt
+                #     the served identity so the retry does not conflict
+                #     against the stale HEAD identity forever. Restart budget
+                #     is bounded per pass (see _MAX_IDENTITY_CONFLICT_RESTARTS).
                 _adopt_identity(current, response)
-                _drain_response(response)
-                response.close()
-                staging_path.unlink(missing_ok=True)
-                continue
+                if response.status_code == 200:
+                    logger.warning(
+                        "GET identity conflicts with HEAD identity on full 200; "
+                        "adopting served identity and consuming as-is",
+                    )
+                else:
+                    conflict_restarts += 1
+                    if conflict_restarts > _MAX_IDENTITY_CONFLICT_RESTARTS:
+                        response.close()
+                        raise IdentityConflictError(
+                            "Identity conflicts persist past the restart "
+                            f"budget of {_MAX_IDENTITY_CONFLICT_RESTARTS}"
+                        )
+                    logger.warning(
+                        "GET identity conflicts with HEAD identity; restarting "
+                        "(%d/%d)",
+                        conflict_restarts,
+                        _MAX_IDENTITY_CONFLICT_RESTARTS,
+                    )
+                    # Close without draining (see docstring); then restart.
+                    response.close()
+                    staging_path.unlink(missing_ok=True)
+                    continue
             mode = "ab" if response.status_code == 206 else "wb"
             if mode == "ab":
                 resumed = True
@@ -730,7 +979,7 @@ def _verified_attempt(
                     "Staging file %s modified before append; restarting",
                     staging_path,
                 )
-                _drain_response(response)
+                # Close without draining (see docstring); then restart.
                 response.close()
                 staging_path.unlink(missing_ok=True)
                 continue
@@ -752,6 +1001,7 @@ def download_verified(
     session: requests.Session | None = None,
     identity_manifest_path: Path | None = None,
     download_root: Path | None = None,
+    allow_local: bool = False,
 ) -> VerifiedDownload:
     """Perform a resumable, identity-verified staged download.
 
@@ -761,12 +1011,16 @@ def download_verified(
     identity sidecar so resumptions can be validated.
 
     URL policy (SSRF guard): the initial ``url`` must be http(s) without
-    userinfo, and every resolved address must be public — except that
-    loopback/private/link-local targets are permitted for the initial URL
-    itself (an operator may intentionally download from a local media
-    server). Every redirect hop is strictly public-only: a server that
-    bounces the download to an internal address fails the download as a
-    network error (URLPolicyError, a requests.RequestException).
+    userinfo, and every resolved address must be public. Local-network
+    (loopback/private/link-local) destinations are rejected by default;
+    pass ``allow_local=True`` only when the caller trusts the URL source
+    (e.g. an operator intentionally downloading from a local media server).
+    The pre-connect check is a fast pre-filter only: the primary SSRF
+    barrier is a connection-time peer guard that rejects the ACTUAL TCP peer
+    on every connect, so a rebinding resolver cannot bypass the policy.
+    Every redirect hop is strictly public-only: a server that bounces the
+    download to an internal address fails the download as a network error
+    (URLPolicyError, a requests.RequestException).
 
     Path confinement: when ``download_root`` is given, ``staging_path``,
     the identity manifest, and the manifest's tmp sibling must all
@@ -791,12 +1045,17 @@ def download_verified(
         expected_size: Expected final byte count, or None when unknown.
         timeout: Timeout/retry policy (defaults to TimeoutPolicy()).
         progress: Optional callback(downloaded_total, expected_or_-1).
-        session: Optional requests.Session (creates one if None).
+        session: Optional requests.Session (creates one if None). Passing a
+            caller session in opts it into the redirect hook and the
+            connection-time peer guard as well.
         identity_manifest_path: Sidecar JSON path (defaults to
             staging_path + '.identity.json').
         download_root: When given, staging/manifest paths must resolve
             under it and symlinks at the staging path are refused;
             None disables confinement (warns).
+        allow_local: When False (default), local-network (loopback/
+            private/link-local) initial URLs are rejected. Enable only when
+            the caller trusts the URL source.
 
     Returns:
         A structured VerifiedDownload outcome; errors never escape.
@@ -835,15 +1094,26 @@ def download_verified(
     last_error_class: str | None = None
     last_error_message: str | None = None
     assert session is not None  # narrowed by own_session branch above
-    _install_url_policy(session)
+    # Connection-time peer guard: the allowed-local set is the initial
+    # hostname only (when local access was opted in), so a rebinding resolver
+    # cannot turn a hostname into an internal peer.
+    initial_hostname = urlparse(url).hostname
+    allowed_local = (
+        frozenset({initial_hostname.lower()})
+        if allow_local and initial_hostname
+        else frozenset()
+    )
+    _install_peer_check(session, allowed_local)
+    _install_url_policy(session, allow_local=allow_local)
     try:
-        # The initial URL is operator-chosen: loopback/private/link-local
-        # targets are permitted (local media server); redirect hops are
-        # validated strictly by the session hook instead. A URL that
-        # fails here fails identically on every retry, so report the
-        # structured outcome immediately instead of burning the budget.
+        # The initial URL is operator-chosen; whether its loopback/private/
+        # link-local targets are permitted is the caller's allow_local
+        # decision. Redirect hops are validated strictly by the session hook
+        # and the connection-time peer guard instead. A URL that fails here
+        # fails identically on every retry, so report the structured outcome
+        # immediately instead of burning the budget.
         try:
-            _assert_public_url(url, allow_local=True)
+            _assert_public_url(url, allow_local=allow_local)
         except URLPolicyError as exc:
             logger.warning("Initial URL rejected by policy for %s: %s", url, exc)
             return _verified_failure(
@@ -905,8 +1175,30 @@ def download_verified(
                     final_path=staging_path,
                     resumed=resumed,
                 )
-            # Verified: only now may the manifest claim completion.
-            _record_identity(manifest_path, current, complete=True)
+            # Verified: only now may the manifest claim completion. The
+            # verified bytes are complete and correct in the staging file;
+            # only the manifest write is left, and a failure there (OSError)
+            # must not escape — report a structured failure carrying the
+            # verified bytes. The staging file remains valid for caller-side
+            # finalization.
+            try:
+                _record_identity(manifest_path, current, complete=True)
+            except OSError as exc:
+                logger.warning(
+                    "Failed to record complete identity for %s: %s: %s",
+                    manifest_path,
+                    type(exc).__name__,
+                    exc,
+                )
+                return _verified_failure(
+                    expected_size,
+                    current,
+                    type(exc).__name__,
+                    str(exc),
+                    ok_bytes=final_size,
+                    final_path=staging_path,
+                    resumed=resumed,
+                )
             return VerifiedDownload(
                 ok=True,
                 bytes_downloaded=final_size,
@@ -1043,6 +1335,10 @@ def download_files(
             try:
                 session = requests.Session()
                 session.mount("https://", HTTPAdapter(max_retries=1))
+                # SSRF guards (strict: no local addresses); the
+                # connection-time peer guard is the primary barrier.
+                _install_peer_check(session, frozenset())
+                _install_url_policy(session)
                 with _sessions_lock:
                     _active_sessions.add(session)
 
