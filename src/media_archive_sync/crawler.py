@@ -27,12 +27,25 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 from .logging import get_logger
 from .strings import urldecode
 
 logger = get_logger(__name__)
+
+
+def _href(a: Tag) -> str:
+    """Extract a safe ``str`` href from a tag.
+
+    BeautifulSoup's ``__getitem__`` may return ``AttributeValueList`` for
+    multi-valued attributes, so normalize to the first string value here
+    instead of trusting the attribute type inline.
+    """
+    value = a["href"]
+    if isinstance(value, str):
+        return value
+    return value[0] if value else ""
 
 
 def fetch_html(url: str) -> str:
@@ -102,8 +115,9 @@ def crawl_archive(
     """
     if not remote_base and not start_dir:
         raise ValueError("Either remote_base or start_dir must be provided")
-
-    base_url = (start_dir or remote_base).rstrip("/") + "/"
+    root = start_dir or remote_base
+    assert root is not None
+    base_url = root.rstrip("/") + "/"
     remote_base_normalized = (remote_base or base_url).rstrip("/") + "/"
     # Use base_url as prefix when start_dir is provided to limit scope
     prefix = base_url if start_dir else remote_base_normalized
@@ -145,7 +159,7 @@ def crawl_archive(
 
         # Find subdirectories
         for a in soup.find_all("a", href=True):
-            href = a["href"]
+            href = _href(a)
             if href == "../":
                 continue
             if href.endswith("/"):
@@ -158,7 +172,7 @@ def crawl_archive(
         # Count and collect media files
         dir_counts[dir_url] = 0
         for a in soup.find_all("a", href=True):
-            href = a["href"]
+            href = _href(a)
             full_url = urllib.parse.urljoin(dir_url, href)
             parsed_url = urllib.parse.urlparse(full_url)
             parsed_path = parsed_url.path
@@ -211,7 +225,7 @@ def fetch_directory(
             return out
         soup = BeautifulSoup(html, "html.parser")
         for a in soup.find_all("a", href=True):
-            href = a["href"]
+            href = _href(a)
             # Skip parent directory and self references
             if href in ("../", "./"):
                 continue
@@ -249,14 +263,15 @@ def save_metadata(dir_url: str, media_meta_file: Path) -> None:
         media_meta_file: Path to the JSON file for storing metadata.
     """
     try:
-        meta = {}
+        meta: dict[str, object] = {}
         if media_meta_file.is_file():
             with media_meta_file.open("r", encoding="utf-8") as mf:
-                meta = json.load(mf)
-        # Validate that loaded meta is a dict; reset if not
-        if not isinstance(meta, dict):
-            logger.debug("Media meta cache was not a dict, resetting")
-            meta = {}
+                loaded = json.load(mf)
+            # Validate that loaded meta is a dict; reset if not
+            if isinstance(loaded, dict):
+                meta = loaded
+            else:
+                logger.debug("Media meta cache was not a dict, resetting")
     except (json.JSONDecodeError, TypeError, OSError) as e:
         logger.debug("Failed to load existing media meta: %s", e)
         meta = {}
@@ -393,7 +408,7 @@ def find_missing_to_append(
         but not in cached_media.
     """
     if match_by == "name":
-        existing = {n for _, n in (cached_media or [])}
+        existing: set[str] = {n for _, n in (cached_media or [])}
         seen = set(existing)
         to_append: list[tuple[str, str]] = []
         for full, dec in month_items or []:
@@ -402,8 +417,10 @@ def find_missing_to_append(
                 seen.add(dec)
         return to_append
     elif match_by == "tuple":
-        existing = set(cached_media or [])
-        return [item for item in (month_items or []) if item not in existing]
+        # Distinct name avoids no-redef with the "name" branch; annotation
+        # stops mypy from inferring that branch's set[str] element type.
+        existing_tuples: set[tuple[str, str]] = set(cached_media or [])
+        return [item for item in (month_items or []) if item not in existing_tuples]
     else:
         raise ValueError(
             f"Unknown match_by value: {match_by!r}. Expected 'tuple' or 'name'."
@@ -536,7 +553,7 @@ def fetch_remote_page(dir_url: str) -> list[tuple[str, str]]:
             return out
         soup = BeautifulSoup(html, "html.parser")
         for a in soup.find_all("a", href=True):
-            href = a["href"]
+            href = _href(a)
             if href in ("../", "./"):
                 continue
             if href.endswith("/"):

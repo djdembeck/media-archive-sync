@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "media-archive-sync"
-version = "0.3.0"
+version = "0.3.2"
 description = "Download and organize media from web archives"
 readme = "README.md"
 license = {text = "MIT"}
@@ -34,6 +34,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    # >=83.0.0 clears PYSEC-2026-3447 (pip-audit blocks the vulncheck job otherwise)
+    "setuptools>=83.0.0",
     "pytest>=8.0.0",
     "pytest-cov>=4.0.0",
     "pytest-xdist>=3.0.0",
@@ -41,6 +43,8 @@ dev = [
     "ruff>=0.1.0",
     "black>=24.0.0",
     "mypy>=1.0.0",
+    "types-requests>=2.31.0",
+    "types-tqdm>=4.66.0",
     "responses>=0.24",  # For mocking HTTP requests in tests
     "httmock>=1.4",     # Alternative HTTP mocking
 ]

@@ -7,8 +7,12 @@
 #      from commits since the last tag (conventional commits:
 #      BREAKING CHANGE/feat! -> major, feat -> minor, else patch). Dispatch
 #      with a `version` or `bump` input to override.
-#   2. The tag is created and pushed (skipped if it already exists).
-#   3. The release is created via the gh CLI. The GitHub App fills release
+#   2. The pyproject.toml version is bumped to match the tag (idempotent) and
+#      committed + pushed.
+#   3. The tag is created and pushed (skipped if it already exists).
+#   4. The release Docker image is built + pushed as ${REGISTRY}:${VERSION}
+#      (idempotent — skipped when the image already exists).
+#   5. The release is created via the gh CLI. The GitHub App fills release
 #      notes via the release webhook (fill-after mode).
 #
 # Re-runs are idempotent: a partial failure can be re-dispatched and the same
@@ -19,8 +23,14 @@ name: Release
 on:
   push:
     branches: [main]
-    # Release only on code changes — CI/docs-only merges must not bump or cut.
-    paths-ignore: ['*.md', 'docs/**', '.github/**', 'renovate.json5', '.pre-commit-config.yaml', 'Makefile', '.gitignore', 'LICENSE']
+    # Release only on code changes — inert-only merges must not bump or cut.
+    # Mirrors the ci.yml classifier inert set, EXCEPT no `*.md` entry: GitHub
+    # path filters have no negation, and the Dockerfile COPYs README.md into
+    # the image, so a README-only push is an image change and must release.
+    # docs stay covered by docs/** and .github/**/*.md. No image-affecting
+    # path (Dockerfile, pyproject.toml, src/) is filtered.
+    paths-ignore:
+      ['docs/**', 'renovate.json5', '.pre-commit-config.yaml', '.gitignore', '.editorconfig', 'LICENSE', '.env.example', '.github/**/*.md', 'Makefile', '.coderabbit.yaml']
   workflow_dispatch:
     inputs:
       version:                       # manual override
@@ -33,7 +43,7 @@ on:
         default: auto
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release
@@ -51,6 +61,9 @@ jobs:
         with:
           # Full history so version resolution can inspect all refs.
           fetch-depth: 0
+          # KEEP persisted credentials (3a exception) — this workflow pushes
+          # the version-bump commit and the tag; the job is scoped to
+          # contents: write instead of disabling persistence.
 
       - name: Configure Git
         ## Annotated tags need a git identity; the runner ships none.
@@ -65,7 +78,7 @@ jobs:
           VERSION_INPUT="${{ inputs.version }}"
           BUMP_INPUT="${{ inputs.bump }}"
 
-          LATEST_TAG=$(git tag -l "v*.*.*" --sort=-version:refname | head -n 1 || true)
+          LATEST_TAG="$(git tag -l 'v*.*.*' --sort=-version:refname | head -n 1 || true)"
 
           if [ -n "$VERSION_INPUT" ]; then
             # Manual override
@@ -93,10 +106,14 @@ jobs:
                   echo "No commits since ${LATEST_TAG} — reusing it"
                   exit 0
                 fi
-                LOG=$(git log --format=%B "${LATEST_TAG}..HEAD" 2>/dev/null || true)
-                if echo "$LOG" | grep -qE 'BREAKING CHANGE:|^[a-z]+(\([^)]*\))?!: '; then LEVEL=major
-                elif echo "$LOG" | grep -qE '^feat(\([^)]*\))?: '; then LEVEL=minor
-                else LEVEL=patch; fi
+                LOG="$(git log --format=%B "${LATEST_TAG}..HEAD" 2>/dev/null || true)"
+                if echo "$LOG" | grep -qE 'BREAKING CHANGE:|^[a-z]+(\([^)]*\))?!: '; then
+                  LEVEL="major"
+                elif echo "$LOG" | grep -qE '^feat(\([^)]*\))?: '; then
+                  LEVEL="minor"
+                else
+                  LEVEL="patch"
+                fi
                 ;;
               patch|minor|major) LEVEL="$BUMP_INPUT" ;;
               *) echo "Invalid bump input: ${BUMP_INPUT} (auto|patch|minor|major)"; exit 1 ;;
@@ -114,8 +131,10 @@ jobs:
           echo "previous_tag=${LATEST_TAG:-}" >> "$GITHUB_OUTPUT"
           echo "New version: ${NEW_VERSION} (previous: ${LATEST_TAG:-none})"
 
-      # Bump pyproject.toml version to match the tag. Idempotent — skips if already at target.
-      # The pushed commit re-triggers this workflow; the tag-exists guard makes the second run a no-op.
+      # Bump pyproject.toml version to match the tag. Idempotent — skips if
+      # already at target (prevents empty-commit failures on re-runs and on the
+      # push-triggered second run). The pushed commit re-triggers this
+      # workflow; the tag-exists guard makes the second run a no-op.
       - name: Bump manifest version
         run: |
           set -euo pipefail
@@ -151,8 +170,8 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${{ steps.version.outputs.new_version }}"
-          # NOTE: Dockerfile must define `ARG VERSION=devel` and use it for version stamping.
-          # Currently the Dockerfile has no ARG VERSION — add it and pass to the build.
+          # The Dockerfile defines `ARG VERSION=devel` for version stamping;
+          # pass the release version as a build arg.
           if [ "${{ steps.tag.outputs.created }}" = "true" ] || ! docker manifest inspect "${REGISTRY}:${VERSION}" >/dev/null 2>&1; then
             docker build --build-arg VERSION="${VERSION}" -t "${REGISTRY}:${VERSION}" .
             echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
@@ -171,5 +190,7 @@ jobs:
             echo "Release ${VERSION} already exists — nothing to do"
             exit 0
           fi
-          # Annalist GitHub App fills the body via the release webhook (fill-after mode).
+          # Annalist GitHub App fills the body via the release webhook
+          # (fill-after mode). The App's URL is configured in App settings,
+          # never in the repo.
           gh release create "${VERSION}" --title "Release ${VERSION}" --notes ""

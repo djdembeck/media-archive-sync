@@ -18,7 +18,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -154,13 +154,13 @@ def download_file(
             logger.debug("Successfully downloaded %s -> %s", url, local_path)
             return True, downloaded
 
+        # The parameter is guaranteed non-None here: callers pass their own
+        # session, or we created one above when it was None.
+        assert session is not None
         if own_session:
             with session:
-                result = _do_download(session)
-                return result
-        else:
-            result = _do_download(session)
-            return result
+                return _do_download(session)
+        return _do_download(session)
 
     except DownloadCancelledError:
         logger.debug("Download cancelled for %s", url)
@@ -885,12 +885,15 @@ class DownloadManager:
             with self._partials_lock:
                 self._partials.add(temp_path)
 
-            # Wrap progress callback to include filename
+            # Wrap progress callback to include filename. Capture in a local
+            # so the closure can be narrowed (mypy can't narrow ``self.x``
+            # inside a nested function).
+            progress_cb = self.progress_callback
             wrapped_callback: Callable[[int, int], None] | None = None
-            if self.progress_callback:
+            if progress_cb is not None:
 
                 def wrapped(bytes_done: int, total: int) -> None:
-                    self.progress_callback(local_path.name, bytes_done, total)
+                    progress_cb(local_path.name, bytes_done, total)
 
                 wrapped_callback = wrapped
 
@@ -966,7 +969,7 @@ class DownloadManager:
         """Context manager entry."""
         return self
 
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> bool:
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> Literal[False]:
         """Context manager exit - cleanup partial files."""
         self.cleanup_partials()
         return False

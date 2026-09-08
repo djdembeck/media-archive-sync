@@ -88,9 +88,13 @@ class Cache:
                 data = json.load(f)
             if isinstance(data, dict) and "_cache_envelope" in data:
                 envelope = data["_cache_envelope"]
-                return envelope.get("key") if isinstance(envelope, dict) else None
+                if isinstance(envelope, dict):
+                    cached_key = envelope.get("key")
+                    return cached_key if isinstance(cached_key, str) else None
+                return None
             if isinstance(data, dict) and "_cache_key" in data:
-                return data["_cache_key"]
+                cached_key = data["_cache_key"]
+                return cached_key if isinstance(cached_key, str) else None
             return path.stem
         except (OSError, json.JSONDecodeError):
             return None
