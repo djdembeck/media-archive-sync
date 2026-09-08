@@ -10,6 +10,18 @@
       "matchManagers": ["github-actions"]
     }
   ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "pip-audit pin in .github/workflows/vulncheck.yml",
+      "fileMatch": ["^\\.github/workflows/vulncheck\\.yml$"],
+      "matchStrings": [
+        "pip-audit==(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "datasourceTemplate": "pypi",
+      "depNameTemplate": "pip-audit"
+    }
+  ],
   "dockerfile": {
     "enabled": true
   },
