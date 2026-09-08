@@ -41,6 +41,8 @@ dev = [
     "ruff>=0.1.0",
     "black>=24.0.0",
     "mypy>=1.0.0",
+    "types-requests>=2.31.0",
+    "types-tqdm>=4.66.0",
     "responses>=0.24",  # For mocking HTTP requests in tests
     "httmock>=1.4",     # Alternative HTTP mocking
 ]

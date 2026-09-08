@@ -11,7 +11,7 @@ import os
 import sys
 from collections.abc import Iterable
 from contextlib import contextmanager
-from typing import Any, TextIO
+from typing import Any, Literal, TextIO
 
 
 class _DummyTqdm:
@@ -51,8 +51,13 @@ class _DummyTqdm:
 
 try:
     from tqdm import tqdm
+
+    TQDM_AVAILABLE = True
 except ImportError:
-    tqdm = _DummyTqdm
+    # Rebinding the imported ``tqdm`` name to the fallback class would
+    # re-assign a type; the TQDM_AVAILABLE flag is used at call sites.
+    tqdm = _DummyTqdm  # type: ignore[assignment,misc]
+    TQDM_AVAILABLE = False
 
 
 # Rich is optional - provides beautiful progress bars
@@ -153,7 +158,7 @@ class _TqdmProgressWrapper:
         self.disable = disable
         self.unit = unit
         self._pbar: Any | None = None
-        self.n = 0
+        self.n = 0.0
 
     def __enter__(self) -> _TqdmProgressWrapper:
         self._pbar = tqdm_or_stderr(
@@ -164,7 +169,7 @@ class _TqdmProgressWrapper:
         )
         return self
 
-    def __exit__(self, *exc) -> bool:
+    def __exit__(self, *exc: Any) -> Literal[False]:
         if self._pbar is not None:
             self._pbar.close()
         return False
@@ -210,7 +215,7 @@ if RICH_AVAILABLE:
             self.unit = unit
             self._progress: Progress | None = None
             self._task_id: TaskID | None = None
-            self.n = 0
+            self.n = 0.0
 
         def __enter__(self) -> _RichProgressWrapper:
             if not self.disable:
@@ -229,7 +234,7 @@ if RICH_AVAILABLE:
                 )
             return self
 
-        def __exit__(self, *exc) -> bool:
+        def __exit__(self, *exc: Any) -> Literal[False]:
             if self._progress is not None:
                 self._progress.stop()
             return False
@@ -351,7 +356,7 @@ def safe_print(message: str, *args, console: Any | None = None) -> None:
         return
 
     # Prefer tqdm.write when tqdm is available (not the dummy)
-    if tqdm is not _DummyTqdm:
+    if TQDM_AVAILABLE:
         tqdm.write(message, file=sys.stderr)
         return
 
