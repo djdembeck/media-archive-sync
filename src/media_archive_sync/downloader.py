@@ -508,6 +508,7 @@ def download_verified(
     current: dict | None = None
     error_class: str | None = None
     error_message: str | None = None
+    assert session is not None  # narrowed by own_session branch above
     try:
         for attempt in range(policy.retry_attempts):
             if attempt > 0:
