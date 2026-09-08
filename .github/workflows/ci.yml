@@ -19,6 +19,16 @@ jobs:
   # (docs/config-only) changes skip the expensive jobs. No needs: — it is the
   # first thing that runs. A non-success classifier makes every downstream
   # `needs['changes'].result == 'success'` predicate skip (fail closed).
+  #
+  # The classifier script is extracted from the TRUSTED base-branch ref (PR
+  # base sha on pull_request, push before sha on push) and run from that,
+  # never from the PR checkout: the `changes` job makes the gate decision for
+  # every downstream job, so PR-controlled code must not be able to make it
+  # (a PR could otherwise edit .ci/changes.sh in its own checkout to report
+  # "no concerns" and skip every required check — GitHub reports if-skipped
+  # jobs as successful). When no trusted script is available (no trusted
+  # ref, script not present at the base ref), the job emits all-true so the
+  # full check suite runs.
   changes:
     runs-on: ubuntu-latest
     permissions:
@@ -46,11 +56,49 @@ jobs:
       - name: Classify changed paths
         id: classify
         run: |
-          # Writes exactly four `<flag>=true|false` lines to stdout, captured
-          # into $GITHUB_OUTPUT as the job outputs. Exits 0 with all-true on
-          # any "unable to classify" case (fail-safe full run); exits nonzero
-          # only on a real infrastructure failure (fail closed).
-          bash .ci/changes.sh > "$GITHUB_OUTPUT"
+          # Extracts .ci/changes.sh from the trusted base-branch ref and runs
+          # IT — the PR checkout must not decide which checks run. The
+          # script consumes EVENT/BASE/HEAD/BEFORE/SHA/REF from the job env
+          # (declared above), which this step inherits.
+          #
+          # Machine contract: the script writes exactly four
+          # `<flag>=true|false` lines to stdout, captured into $GITHUB_OUTPUT
+          # as the job outputs.
+          #
+          # Fallback taxonomy:
+          #   - No trusted ref (workflow_dispatch, tag push) or the script is
+          #     missing/empty at it -> emit all-true, exit 0 (cannot
+          #     classify -> the full check suite runs).
+          #   - Trusted script exits 0 with all-true -> its own fail-safe
+          #     (unresolvable base, empty diff, ...) -> full run, job green.
+          #   - Trusted script exits nonzero -> real infrastructure failure
+          #     -> propagate it so the job reports failure (fail closed).
+          set -uo pipefail
+          TRUSTED_REF=""
+          if [ "$EVENT" = "pull_request" ] && [ -n "$BASE" ]; then
+            TRUSTED_REF="$BASE"
+          elif [ "$EVENT" = "push" ] && [ -n "$BEFORE" ] && \
+               [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            TRUSTED_REF="$BEFORE"
+          fi
+          CLASSIFIER="$(mktemp)" || exit 1
+          trap 'rm -f "$CLASSIFIER"' EXIT
+          if [ -n "$TRUSTED_REF" ] && \
+             git show "$TRUSTED_REF:.ci/changes.sh" > "$CLASSIFIER" 2>/dev/null && \
+             [ -s "$CLASSIFIER" ]; then
+            # Last command of the step: a nonzero exit from the trusted
+            # script fails the job (fail closed).
+            bash "$CLASSIFIER" > "$GITHUB_OUTPUT"
+          else
+            # No trusted classifier available -> cannot classify -> all
+            # checks must run.
+            {
+              echo "workflow=true"
+              echo "lint=true"
+              echo "test=true"
+              echo "docker=true"
+            } >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Summary
         if: always()
@@ -218,6 +266,9 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # The "Create PR comment" step posts via peter-evans/create-or-update-
+      # comment, which requires the GITHUB_TOKEN to hold issues: write.
+      issues: write
     env:
       PR_IS_SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
     steps:

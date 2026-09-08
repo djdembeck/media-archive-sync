@@ -12,7 +12,7 @@ import tempfile
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from xml.etree import ElementTree as ET
 
 from .logging import get_logger
@@ -195,7 +195,13 @@ def build_movie_nfo(
         elif isinstance(actors, set):
             actor_list = sorted(actors)
         else:
-            actor_list = list(actors)
+            if isinstance(actors, (list, tuple)):
+                actor_list = list(actors)
+            else:
+                # Untyped metadata (meta.get("actors")) can carry a truthy
+                # non-iterable (e.g. an int from hand-edited JSON) — treat it
+                # as a single actor, matching the pre-regression wrap.
+                actor_list = [cast("str | dict[str, Any]", actors)]
         for actor_item in actor_list:
             if not actor_item:
                 continue
@@ -254,7 +260,13 @@ def build_movie_nfo(
         elif isinstance(genres, set):
             genre_list = sorted(genres)
         else:
-            genre_list = genres
+            if isinstance(genres, (list, tuple)):
+                genre_list = list(genres)
+            else:
+                # Untyped metadata (meta.get("genres")) can carry a truthy
+                # non-iterable (e.g. an int from hand-edited JSON) — treat it
+                # as a single genre, matching the pre-regression wrap.
+                genre_list = [cast("str", genres)]
         for genre_name in genre_list:
             if not genre_name:
                 continue
@@ -276,7 +288,13 @@ def build_movie_nfo(
         elif isinstance(tags, set):
             tag_list = sorted(tags)
         else:
-            tag_list = tags
+            if isinstance(tags, (list, tuple)):
+                tag_list = list(tags)
+            else:
+                # Untyped metadata (meta.get("tags")) can carry a truthy
+                # non-iterable (e.g. an int from hand-edited JSON) — treat it
+                # as a single tag, matching the pre-regression wrap.
+                tag_list = [cast("str", tags)]
         for tag_name in tag_list:
             if not tag_name:
                 continue

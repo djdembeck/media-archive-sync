@@ -40,17 +40,19 @@ commit() { # commit <file>...
 
 sha() { git -C "$REPO" rev-parse "HEAD${1:-}"; }
 
-# run_classifier: run changes.sh in a subprocess, cwd=REPO, env passed in.
-# Sets RC (exit code) and FLAGS (the machine contract: the four
-# <flag>=true|false lines on stdout, sorted) and ERR (stderr, for debugging).
+# run_classifier: run changes.sh ONCE in a subprocess, cwd=REPO, env passed
+# in. Sets RC (exit code), FLAGS (the FULL stdout, sorted — the machine
+# contract is EXACTLY the four <flag>=true|false lines, so any extra stdout
+# line fails the case), and ERR (stderr, for debugging).
 run_classifier() {
-  ERR="$(cd "$REPO" && EVENT="$EVENT" REF="${REF:-}" BASE="${BASE:-}" HEAD="${HEAD:-}" \
-    BEFORE="${BEFORE:-}" SHA="${SHA:-}" bash "$CLASSIFIER" 2>&1 >/dev/null)"
-  RC=$?
-  local raw
-  raw="$(cd "$REPO" && EVENT="$EVENT" REF="${REF:-}" BASE="${BASE:-}" HEAD="${HEAD:-}" \
-    BEFORE="${BEFORE:-}" SHA="${SHA:-}" bash "$CLASSIFIER" 2>/dev/null)"
-  FLAGS="$(printf '%s\n' "$raw" | grep -E '^(workflow|lint|test|docker)=(true|false)$' | sort | tr '\n' ' ' | sed 's/ $//')"
+  local err_file="$WORKDIR/classifier.err"
+  out="$(cd "$REPO" && EVENT="$EVENT" REF="${REF:-}" BASE="${BASE:-}" HEAD="${HEAD:-}" \
+    BEFORE="${BEFORE:-}" SHA="${SHA:-}" bash "$CLASSIFIER" 2>"$err_file")"
+  rc=$?
+  ERR="$(cat "$err_file" 2>/dev/null || true)"
+  rm -f "$err_file"
+  RC=$rc
+  FLAGS="$(printf '%s\n' "$out" | sort | tr '\n' ' ' | sed 's/ $//')"
 }
 
 # run_case <name> <expected_flags...> <expected_exit>
