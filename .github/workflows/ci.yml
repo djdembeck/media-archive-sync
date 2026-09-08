@@ -266,9 +266,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-      # The "Create PR comment" step posts via peter-evans/create-or-update-
-      # comment, which requires the GITHUB_TOKEN to hold issues: write.
-      issues: write
     env:
       PR_IS_SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
     steps:
@@ -315,27 +312,3 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      - name: Find PR comment
-        if: github.event_name == 'pull_request' && env.PR_IS_SAME_REPO == 'true'
-        uses: peter-evans/find-comment@b30e6a3c0ed37e7c023ccd3f1db5c6c0b0c23aad # v4.0.0
-        id: find-comment
-        with:
-          issue-number: ${{ github.event.pull_request.number }}
-          body-includes: 'Docker image ready'
-
-      - name: Create PR comment
-        if: github.event_name == 'pull_request' && env.PR_IS_SAME_REPO == 'true' && steps.find-comment.outputs.comment-id == ''
-        uses: peter-evans/create-or-update-comment@e8674b075228eee787fea43ef493e45ece1004c9 # v5.0.0
-        with:
-          issue-number: ${{ github.event.pull_request.number }}
-          body: |
-            ## 🐳 Docker image ready
-
-            A test image for this PR is available:
-
-            ```bash
-            docker pull ghcr.io/djdembeck/media-archive-sync:pr-${{ github.event.pull_request.number }}
-            ```
-
-            The `pr-${{ github.event.pull_request.number }}` tag is stable — new commits on this PR overwrite it with the latest build. The image is deleted automatically when the PR closes.
