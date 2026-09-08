@@ -12,7 +12,7 @@ import tempfile
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from xml.etree import ElementTree as ET
 
 from .logging import get_logger
@@ -159,9 +159,9 @@ def build_movie_nfo(
     _add_text("title", effective_title)
     _add_text("originaltitle", original_title)
     _add_text("sorttitle", original_title if original_title else effective_title)
-    _add_text("year", year)
+    _add_text("year", str(year) if year is not None else None)
     _add_text("plot", plot)
-    _add_text("runtime", runtime)
+    _add_text("runtime", str(runtime) if runtime is not None else None)
     _add_text("premiered", releasedate)
 
     # Add director
@@ -191,13 +191,17 @@ def build_movie_nfo(
     if actors:
         seen_actors: dict[str, dict[str, Any]] = {}
         if isinstance(actors, str):
-            actor_list = [actors]
+            actor_list: Sequence[str | dict[str, Any]] = [actors]
         elif isinstance(actors, set):
             actor_list = sorted(actors)
         else:
-            actor_list = actors
-        if not isinstance(actor_list, list | tuple):
-            actor_list = [actor_list]
+            if isinstance(actors, (list, tuple)):
+                actor_list = list(actors)
+            else:
+                # Untyped metadata (meta.get("actors")) can carry a truthy
+                # non-iterable (e.g. an int from hand-edited JSON) — treat it
+                # as a single actor, matching the pre-regression wrap.
+                actor_list = [cast("str | dict[str, Any]", actors)]
         for actor_item in actor_list:
             if not actor_item:
                 continue
@@ -252,13 +256,17 @@ def build_movie_nfo(
     seen_genres: set[str] = set()
     if genres:
         if isinstance(genres, str):
-            genre_list = [genres]
+            genre_list: Sequence[str] = [genres]
         elif isinstance(genres, set):
             genre_list = sorted(genres)
         else:
-            genre_list = genres
-        if not isinstance(genre_list, list | tuple):
-            genre_list = [genre_list]
+            if isinstance(genres, (list, tuple)):
+                genre_list = list(genres)
+            else:
+                # Untyped metadata (meta.get("genres")) can carry a truthy
+                # non-iterable (e.g. an int from hand-edited JSON) — treat it
+                # as a single genre, matching the pre-regression wrap.
+                genre_list = [cast("str", genres)]
         for genre_name in genre_list:
             if not genre_name:
                 continue
@@ -276,13 +284,17 @@ def build_movie_nfo(
     seen_tags: set[str] = set()
     if tags:
         if isinstance(tags, str):
-            tag_list = [tags]
+            tag_list: Sequence[str] = [tags]
         elif isinstance(tags, set):
             tag_list = sorted(tags)
         else:
-            tag_list = tags
-        if not isinstance(tag_list, list | tuple):
-            tag_list = [tag_list]
+            if isinstance(tags, (list, tuple)):
+                tag_list = list(tags)
+            else:
+                # Untyped metadata (meta.get("tags")) can carry a truthy
+                # non-iterable (e.g. an int from hand-edited JSON) — treat it
+                # as a single tag, matching the pre-regression wrap.
+                tag_list = [cast("str", tags)]
         for tag_name in tag_list:
             if not tag_name:
                 continue
@@ -306,8 +318,11 @@ def build_movie_nfo(
     if ratings:
         ratings_el = None
         for rating_dict in ratings:
+            # Guard is reachable at runtime: generate_nfo forwards untyped
+            # (Any) metadata values, so entries may be non-dicts despite the
+            # declared list[dict[str, Any]] type.
             if not isinstance(rating_dict, dict):
-                continue
+                continue  # type: ignore[unreachable]
             rating_name = rating_dict.get("name", "")
             if not rating_name:
                 continue
@@ -328,7 +343,7 @@ def build_movie_nfo(
                 votes_el = ET.SubElement(rating_entry_el, "votes")
                 votes_el.text = str(rating_dict["votes"])
     elif ratings is None and rating is not None:
-        _add_text("rating", rating)
+        _add_text("rating", str(rating))
 
     # Add unique IDs
     if uniqueid:

@@ -1,0 +1,57 @@
+# Vulnerability check — dedicated workflow (never folded into ci.yml's needs
+# chain): findings must not cancel CI's docker/cache work, the daily schedule
+# runs independently of push/PR activity, and the required-check name stays
+# stable across config churn.
+#
+# Python ecosystem with NO committed lockfile (python_no_lock): pip-audit reads
+# only pip requirements + installed envs, so we install the project with its
+# dev extras and audit the resulting environment. This is NON-REPRODUCIBLE
+# (the exact dependency set depends on what pip resolves at scan time) — a
+# committed lockfile would make this deterministic. Blocking is exit-code based
+# (no SARIF).
+
+name: Vulnerability check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Daily; vulnerability data can change without a repository change.
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vulncheck-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pip-audit:
+    name: Python vulnerability check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Audit installed environment
+        # Blocking: a non-zero pip-audit exit (a finding) fails the job.
+        run: |
+          python -m pip install --quiet "pip-audit==2.10.1"
+          pip-audit

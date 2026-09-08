@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
     tags: ['v*']
-    paths-ignore: ['*.md', 'docs/**', 'renovate.json5', '.pre-commit-config.yaml', '.gitignore', 'LICENSE']
   pull_request:
   workflow_dispatch:
 
@@ -16,7 +15,172 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Always-on classifier: scopes each diff into per-concern flags so inert
+  # (docs/config-only) changes skip the expensive jobs. No needs: — it is the
+  # first thing that runs. A non-success classifier makes every downstream
+  # `needs['changes'].result == 'success'` predicate skip (fail closed).
+  #
+  # The classifier script is extracted from the TRUSTED base-branch ref (PR
+  # base sha on pull_request, push before sha on push) and run from that,
+  # never from the PR checkout: the `changes` job makes the gate decision for
+  # every downstream job, so PR-controlled code must not be able to make it
+  # (a PR could otherwise edit .ci/changes.sh in its own checkout to report
+  # "no concerns" and skip every required check — GitHub reports if-skipped
+  # jobs as successful). When no trusted script is available (no trusted
+  # ref, script not present at the base ref), the job emits all-true so the
+  # full check suite runs.
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      workflow: ${{ steps.classify.outputs.workflow }}
+      lint: ${{ steps.classify.outputs.lint }}
+      test: ${{ steps.classify.outputs.test }}
+      docker: ${{ steps.classify.outputs.docker }}
+    env:
+      EVENT: ${{ github.event_name }}
+      BASE: ${{ github.event.pull_request.base.sha }}
+      HEAD: ${{ github.event.pull_request.head.sha }}
+      BEFORE: ${{ github.event.before }}
+      SHA: ${{ github.sha }}
+      REF: ${{ github.ref }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Full history so the PR merge-base and push before..sha resolve.
+          fetch-depth: 0
+
+      - name: Classify changed paths
+        id: classify
+        run: |
+          # Extracts .ci/changes.sh from the trusted base-branch ref and runs
+          # IT — the PR checkout must not decide which checks run. The
+          # script consumes EVENT/BASE/HEAD/BEFORE/SHA/REF from the job env
+          # (declared above), which this step inherits.
+          #
+          # Machine contract: the script writes exactly four
+          # `<flag>=true|false` lines to stdout, captured into $GITHUB_OUTPUT
+          # as the job outputs.
+          #
+          # Fallback taxonomy:
+          #   - No trusted ref (workflow_dispatch, tag push) or the script is
+          #     missing/empty at it -> emit all-true, exit 0 (cannot
+          #     classify -> the full check suite runs).
+          #   - Trusted script exits 0 with all-true -> its own fail-safe
+          #     (unresolvable base, empty diff, ...) -> full run, job green.
+          #   - Trusted script exits nonzero -> real infrastructure failure
+          #     -> propagate it so the job reports failure (fail closed).
+          set -uo pipefail
+          TRUSTED_REF=""
+          if [ "$EVENT" = "pull_request" ] && [ -n "$BASE" ]; then
+            TRUSTED_REF="$BASE"
+          elif [ "$EVENT" = "push" ] && [ -n "$BEFORE" ] && \
+               [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            TRUSTED_REF="$BEFORE"
+          fi
+          CLASSIFIER="$(mktemp)" || exit 1
+          trap 'rm -f "$CLASSIFIER"' EXIT
+          if [ -n "$TRUSTED_REF" ] && \
+             git show "$TRUSTED_REF:.ci/changes.sh" > "$CLASSIFIER" 2>/dev/null && \
+             [ -s "$CLASSIFIER" ]; then
+            # Last command of the step: a nonzero exit from the trusted
+            # script fails the job (fail closed).
+            bash "$CLASSIFIER" > "$GITHUB_OUTPUT"
+          else
+            # No trusted classifier available -> cannot classify -> all
+            # checks must run.
+            {
+              echo "workflow=true"
+              echo "lint=true"
+              echo "test=true"
+              echo "docker=true"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Summary
+        if: always()
+        env:
+          WORKFLOW: ${{ steps.classify.outputs.workflow }}
+          LINT: ${{ steps.classify.outputs.lint }}
+          TEST: ${{ steps.classify.outputs.test }}
+          DOCKER: ${{ steps.classify.outputs.docker }}
+        run: |
+          {
+            echo '## changes'
+            echo
+            echo '```text'
+            echo "workflow=${WORKFLOW:-<no output>}"
+            echo "lint=${LINT:-<no output>}"
+            echo "test=${TEST:-<no output>}"
+            echo "docker=${DOCKER:-<no output>}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Dedicated workflow-lint concern (never folded into lint-format): actionlint
+  # the changed workflow files (full-history checkout so the PR merge-base
+  # resolves) + run the committed classifier harness. Flag-gated on its own
+  # `workflow` concern (classifier/harness/local-action/config changes set it).
+  workflow-lint:
+    name: Workflow lint
+    needs: [changes]
+    if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.workflow == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      EVENT: ${{ github.event_name }}
+      BASE: ${{ github.event.pull_request.base.sha }}
+      HEAD: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          # actionlint v1.7.12's go.mod requires go >= 1.25.0.
+          go-version: '1.25'
+
+      - name: Lint changed workflows
+        run: |
+          set -euo pipefail
+          FILES_FILE="$(mktemp)"
+          trap 'rm -f "$FILES_FILE"' EXIT
+          # For a PR, lint only the workflow files the PR changed (ACM);
+          # unresolvable merge-base or a non-PR event -> lint all tracked
+          # workflow files (full run is the safe side).
+          if [ "$EVENT" = "pull_request" ] && [ -n "$BASE" ] && [ -n "$HEAD" ]; then
+            if MB="$(git merge-base "$BASE" "$HEAD" 2>/dev/null)" && [ -n "$MB" ]; then
+              git diff --name-only -z --no-renames --diff-filter=ACM "$MB" "$HEAD" \
+                -- '.github/workflows' '.forgejo/workflows' > "$FILES_FILE"
+            fi
+          fi
+          if [ ! -s "$FILES_FILE" ]; then
+            git ls-files -z -- \
+              '.github/workflows/*.yml' '.github/workflows/*.yaml' \
+              '.forgejo/workflows/*.yml' '.forgejo/workflows/*.yaml' > "$FILES_FILE"
+          fi
+          if [ ! -s "$FILES_FILE" ]; then
+            echo "No workflow files to lint"
+            exit 0
+          fi
+          # actionlint's argv contains ONLY workflow YAML files; xargs -0 is
+          # NUL-safe for filenames containing spaces. Pinned module version.
+          xargs -0 go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 < "$FILES_FILE"
+
+      - name: Run classifier harness
+        run: |
+          bash .ci/changes-test.sh
+
   lint-format:
+    needs: [changes]
+    if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.lint == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -45,18 +209,13 @@ jobs:
       - name: Run mypy
         run: mypy src/
 
-  build:
-    needs: [lint-format]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Build
-        run: echo "Python is interpreted — no build step needed"
-        # Placeholder so the test job chains on build, not lint-format.
-
+  # Python is interpreted — there is no build/compile step, so there is no
+  # separate build job; test chains directly off the lint-format gate.
   test:
-    needs: [build]
+    needs: [changes, workflow-lint, lint-format]
+    if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.test == 'true'
+         && (needs['workflow-lint'].result == 'success' || needs['workflow-lint'].result == 'skipped')
+         && (needs['lint-format'].result == 'success' || needs['lint-format'].result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -78,9 +237,9 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/pyproject.toml') }}
+          key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('**/pyproject.toml') }}
           restore-keys: |
-            ${{ runner.os }}-pip-
+            ${{ runner.os }}-pip-${{ matrix.python-version }}-
 
       - name: Install dependencies
         run: |
@@ -92,14 +251,17 @@ jobs:
 
       - name: Upload coverage
         if: matrix.python-version == '3.11'
-        uses: codecov/codecov-action@e53489f4d376d79066609109e7a95a29eb3740b1 # v7.0.0
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           files: ./coverage.xml
           fail_ci_if_error: false
 
   docker-build:
-    needs: [test]
-    if: success()
+    needs: [changes, workflow-lint, lint-format, test]
+    if: ${{ !cancelled() && needs['changes'].result == 'success' && needs['changes'].outputs.docker == 'true'
+         && (needs['workflow-lint'].result == 'success' || needs['workflow-lint'].result == 'skipped')
+         && (needs['lint-format'].result == 'success' || needs['lint-format'].result == 'skipped')
+         && (needs['test'].result == 'success' || needs['test'].result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -113,10 +275,10 @@ jobs:
           persist-credentials: false
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - name: Log in to Container Registry
         if: github.event_name != 'pull_request' || env.PR_IS_SAME_REPO == 'true'
@@ -150,27 +312,3 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      - name: Find PR comment
-        if: github.event_name == 'pull_request' && env.PR_IS_SAME_REPO == 'true'
-        uses: peter-evans/find-comment@b30e6a3c0ed37e7c023ccd3f1db5c6c0b0c23aad # v4.0.0
-        id: find-comment
-        with:
-          issue-number: ${{ github.event.pull_request.number }}
-          body-includes: 'Docker image ready'
-
-      - name: Create PR comment
-        if: github.event_name == 'pull_request' && env.PR_IS_SAME_REPO == 'true' && steps.find-comment.outputs.comment-id == ''
-        uses: peter-evans/create-or-update-comment@e8674b075228eee787fea43ef493e45ece1004c9 # v5.0.0
-        with:
-          issue-number: ${{ github.event.pull_request.number }}
-          body: |
-            ## 🐳 Docker image ready
-
-            A test image for this PR is available:
-
-            ```bash
-            docker pull ghcr.io/djdembeck/media-archive-sync:pr-${{ github.event.pull_request.number }}
-            ```
-
-            The `pr-${{ github.event.pull_request.number }}` tag is stable — new commits on this PR overwrite it with the latest build. The image is deleted automatically when the PR closes.
