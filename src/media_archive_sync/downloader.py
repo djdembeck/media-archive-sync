@@ -16,9 +16,11 @@ import json
 import os
 import signal
 import socket
+import stat
 import threading
 import time
 from collections.abc import Callable, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from ipaddress import IPv4Address, IPv6Address, ip_address
 from pathlib import Path
@@ -132,6 +134,138 @@ def _assert_public_url(url: str, *, allow_local: bool = False) -> None:
             raise URLPolicyError(f"Resolved address not public for {url}: {ip}")
 
 
+# Pinned parent-directory fds for a confined download, keyed by the resolved
+# parent ``Path``. Set for the duration of one :func:`download_verified` call
+# (confinement enabled) and read by the confined leaf helpers so they can
+# open, stat, unlink and rename a leaf relative to the pinned parent inode.
+# See :func:`_open_confined_leaf` / :func:`_confined_stat` /
+# :func:`_confined_unlink`.
+_confined_dirs: ContextVar[dict[Path, int] | None] = ContextVar(
+    "_mas_confined_dirs", default=None
+)
+
+
+def _open_confined_leaf(leaf: Path, flags: int, mode: int) -> int:
+    """Open ``leaf`` with ``O_NOFOLLOW``; pin its parent dir when confined.
+
+    ``O_NOFOLLOW`` always guards the leaf itself: a symlink swapped in at the
+    leaf path between confinement validation and this open is refused (ELOOP)
+    instead of written through. When a parent-directory fd is pinned
+    (confined download), the leaf is opened RELATIVE to that fd via
+    ``dir_fd``: the parent then resolves against the inode captured at open
+    time, so a parent directory swapped for a symlink after validation cannot
+    redirect the write outside the root (it fails the open, not escapes it).
+    Without confinement the plain absolute-path open is used.
+    """
+    parent_fd = _confined_parent_fd(leaf)
+    if parent_fd is not None:
+        return os.open(leaf.name, flags | os.O_NOFOLLOW, mode, dir_fd=parent_fd)
+    return os.open(leaf, flags | os.O_NOFOLLOW, mode)
+
+
+def _open_confined_parent_dirs(*parents: Path) -> dict[Path, int]:
+    """Open each parent directory with ``O_NOFOLLOW | O_DIRECTORY``.
+
+    Returns ``{parent: fd}`` (de-duplicated). ``O_NOFOLLOW`` on the directory
+    open itself refuses a parent that has become a symlink (ELOOP), and the
+    held fd pins the real directory inode for the lifetime of the download so
+    :func:`_open_confined_leaf` can resolve leaves against it. The caller must
+    ``os.close`` every returned fd (see ``download_verified``). A failure to
+    open a later parent closes the already-opened ones (no fd leak).
+    """
+    fds: dict[Path, int] = {}
+    try:
+        for parent in parents:
+            if parent not in fds:
+                fds[parent] = os.open(
+                    parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                )
+    except BaseException:
+        for fd in fds.values():
+            os.close(fd)
+        raise
+    return fds
+
+
+def _confined_parent_fd(leaf: Path) -> int | None:
+    """Pinned fd for ``leaf``'s parent directory, or None when the parent
+    is not pinned (confinement inactive, or the leaf sits in a
+    non-pinned directory).
+
+    Every confined-leaf helper consults the ContextVar — never a captured
+    dict — so once ``download_verified`` closes the fds and resets the
+    ContextVar in its finally, these helpers fall back to the plain Path
+    API and can never touch a closed fd.
+    """
+    confined = _confined_dirs.get()
+    return confined.get(leaf.parent) if confined is not None else None
+
+
+def _confined_stat(leaf: Path) -> os.stat_result:
+    """stat ``leaf`` through the pinned parent fd when confined, so the
+    lookup resolves against the pinned directory inode and a parent
+    symlink swap cannot redirect it. Plain ``leaf.stat()`` otherwise.
+    Raises OSError (including FileNotFoundError) as ``leaf.stat()`` would.
+    """
+    fd = _confined_parent_fd(leaf)
+    if fd is not None:
+        return os.stat(leaf.name, dir_fd=fd)
+    return leaf.stat()
+
+
+def _confined_is_file(leaf: Path) -> bool:
+    """Regular-file check on ``leaf`` through the pinned parent fd when
+    confined; plain ``leaf.is_file()`` otherwise."""
+    fd = _confined_parent_fd(leaf)
+    if fd is not None:
+        try:
+            st = os.stat(leaf.name, dir_fd=fd)
+        except OSError:
+            return False
+        return stat.S_ISREG(st.st_mode)
+    return leaf.is_file()
+
+
+def _confined_unlink(leaf: Path) -> None:
+    """Remove ``leaf`` through the pinned parent fd when confined — it
+    deletes the directory entry itself and can never follow a swapped
+    parent symlink to unlink the target — with ``missing_ok=True``
+    semantics; plain ``leaf.unlink(missing_ok=True)`` otherwise."""
+    fd = _confined_parent_fd(leaf)
+    if fd is not None:
+        try:
+            os.unlink(leaf.name, dir_fd=fd)
+        except FileNotFoundError:
+            return
+        return
+    leaf.unlink(missing_ok=True)
+
+
+def _assert_no_symlinked_dirs_under_root(root: Path, *parents: Path) -> None:
+    """Reject a symlinked directory in the chain between ``root`` and each
+    ``parent`` (the parent itself included, the root excluded).
+
+    ``_open_confined_parent_dirs`` pins parents with O_NOFOLLOW, which only
+    refuses a symlink as the FINAL component of the open path; a symlinked
+    intermediate directory is followed during path traversal, so the pin
+    could capture a different directory than the one
+    ``_enforce_confinement`` validated by resolved path. Rejecting any
+    symlinked component up front keeps the strict O_NOFOLLOW-pinning
+    policy self-consistent: under confinement, no symlinked directory
+    anywhere between the root and a confined parent.
+    """
+    abs_root = Path(os.path.abspath(root))
+    for parent in parents:
+        current = Path(os.path.abspath(parent))
+        while current != abs_root and current != current.parent:
+            if current.is_symlink():
+                raise ValueError(
+                    f"Symlinked directory not allowed under download root "
+                    f"{root} (O_NOFOLLOW pinning): {current}"
+                )
+            current = current.parent
+
+
 def _url_policy_hook(
     response: requests.Response,
     *,
@@ -184,17 +318,27 @@ def _install_url_policy(session: requests.Session, allow_local: bool = False) ->
 
     ``allow_local`` is bound to the hook so the first (operator-chosen)
     response is checked with the caller's local-access decision; redirect
-    hops are always checked strictly regardless.
+    hops are always checked strictly regardless. Reusing a session re-binds
+    the *existing* hook to the new ``allow_local`` rather than stacking a
+    second hook, so a session first installed strict and later reused with
+    ``allow_local=True`` is not locked out by the stale strict binding.
     """
-    if getattr(session, "_mas_url_policy_installed", False):
-        return
-    session.hooks = {
-        "response": [
-            *(session.hooks.get("response", ())),
-            functools.partial(_url_policy_hook, allow_local=allow_local),
-        ]
-    }
-    session._mas_url_policy_installed = True  # type: ignore[attr-defined]
+    hook = getattr(session, "_mas_url_policy_hook", None)
+    if hook is None:
+        hook = functools.partial(_url_policy_hook, allow_local=allow_local)
+        session.hooks = {
+            "response": [
+                *(session.hooks.get("response", ())),
+                hook,
+            ]
+        }
+        session._mas_url_policy_hook = hook  # type: ignore[attr-defined]
+        session._mas_url_policy_installed = True  # type: ignore[attr-defined]
+    elif hook.keywords.get("allow_local") != allow_local:
+        # Update the captured allow_local in place; the stored partial is the
+        # same object the hooks list references, so this is the value the hook
+        # actually uses.
+        hook.keywords["allow_local"] = allow_local
 
 
 def _check_peer(conn: object) -> None:
@@ -206,16 +350,24 @@ def _check_peer(conn: object) -> None:
     (private/loopback/link-local) peers are rejected unless the connection's
     host is in the connection's ``_mas_allowed_local`` set (installed by
     :func:`_peer_checked_connection`). Unparseable peers fail closed
-    (rejected) for every non-allowed host. ``conn`` is a urllib3 connection;
-    ``sock``/``host`` are read via ``getattr`` so this helper is independent
-    of the concrete class.
+    (rejected) for every non-allowed host, and a missing ``sock`` or ``host``
+    (peer uninspectable) fails closed for every host — a guarded connection
+    that cannot be verified is never allowed to proceed. ``conn`` is a
+    urllib3 connection; ``sock``/``host`` are read via ``getattr`` so this
+    helper is independent of the concrete class.
     """
     sock = getattr(conn, "sock", None)
     host_attr = getattr(conn, "host", None)
     allowed_obj: object = getattr(conn, "_mas_allowed_local", frozenset())
     allowed = allowed_obj if isinstance(allowed_obj, frozenset) else frozenset()
+    # Fail closed: if either attribute is missing the peer CANNOT be
+    # inspected, so a silent pass would let a guarded connection connect to
+    # an unverified peer. Raise (and close the socket if one exists) instead.
     if sock is None or host_attr is None:
-        return
+        if sock is not None:
+            with contextlib.suppress(Exception):
+                sock.close()
+        raise URLPolicyError("Unable to inspect connected peer")
     host = str(host_attr).strip("[]").lower()
     host_allowed = host in allowed
     peer = sock.getpeername()[0]
@@ -273,16 +425,14 @@ class _PeerCheckedHTTPAdapter(HTTPAdapter):
         self._mas_allowed_local = allowed_local
         super().__init__()
 
-    def init_poolmanager(
-        self, connections: int, maxsize: int, block: bool = False, **kwargs: object
-    ) -> None:
-        super().init_poolmanager(connections, maxsize, block, **kwargs)
-        # Replace the instance attribute, NOT the shared global: urllib3's
-        # PoolManager assigns the module-level pool_classes_by_scheme dict
-        # directly (no copy), so mutating it would leak the guard into every
-        # other session's PoolManager.
-        manager = self.poolmanager
-        manager.pool_classes_by_scheme = {
+    def _guarded_pool_classes(self) -> dict[str, type]:
+        """Peer-checked pool classes (http + https) for this allowed set.
+
+        Reused by both :meth:`init_poolmanager` (the main pool manager) and
+        :meth:`proxy_manager_for` (the per-proxy pool manager) so proxy
+        connections carry the same connection-time peer guard as direct ones.
+        """
+        return {
             "http": type(
                 "_PeerCheckedHTTPPool",
                 (urllib3.connectionpool.HTTPConnectionPool,),
@@ -304,6 +454,26 @@ class _PeerCheckedHTTPAdapter(HTTPAdapter):
                 },
             ),
         }
+
+    def init_poolmanager(
+        self, connections: int, maxsize: int, block: bool = False, **kwargs: object
+    ) -> None:
+        super().init_poolmanager(connections, maxsize, block, **kwargs)
+        # Replace the instance attribute, NOT the shared global: urllib3's
+        # PoolManager assigns the module-level pool_classes_by_scheme dict
+        # directly (no copy), so mutating it would leak the guard into every
+        # other session's PoolManager.
+        self.poolmanager.pool_classes_by_scheme = self._guarded_pool_classes()
+
+    def proxy_manager_for(self, proxy: str, **proxy_kwargs: object) -> object:
+        manager = super().proxy_manager_for(proxy, **proxy_kwargs)
+        # A proxy request opens a SEPARATE ProxyManager whose pool classes are
+        # otherwise never guarded, so proxy connections would bypass the peer
+        # guard. Apply the same instance-attribute replacement (not the shared
+        # global) so every scheme the proxy pool may connect through is
+        # peer-checked.
+        manager.pool_classes_by_scheme = self._guarded_pool_classes()
+        return manager
 
     def send(
         self,
@@ -530,7 +700,7 @@ class VerifiedDownload:
 
 def _verified_identity(path: Path) -> dict | None:
     """Load a previously recorded source identity from a sidecar manifest."""
-    if not path.is_file():
+    if not _confined_is_file(path):
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -549,13 +719,20 @@ def _record_identity(path: Path, identity: dict, *, complete: bool) -> None:
     }
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     # O_NOFOLLOW on the tmp sibling as well, so a symlink planted at the
-    # sibling path cannot be written through. Path.replace over the manifest
-    # is safe on POSIX: rename(2) replaces the symlink itself rather than
-    # following the final target component.
-    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+    # sibling path cannot be written through. When confined, the tmp leaf is
+    # also opened relative to the pinned parent directory fd so a
+    # parent-directory symlink swap cannot redirect it. The final rename is
+    # dir_fd-relative as well (tmp and final are siblings under the same
+    # pinned manifest parent); rename(2) replaces the final symlink itself
+    # rather than following the target component, in either case.
+    fd = _open_confined_leaf(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, indent=2) + "\n")
-    tmp_path.replace(path)
+    parent_fd = _confined_parent_fd(path)
+    if parent_fd is not None:
+        os.replace(tmp_path.name, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+    else:
+        tmp_path.replace(path)
 
 
 def _head_identity(session: requests.Session, url: str, timeout: tuple) -> dict:
@@ -675,7 +852,10 @@ def _read_body(
     total = base
     if mode == "ab":
         try:
-            actual = staging_path.stat().st_size
+            # _confined_stat resolves through the pinned parent fd when
+            # confined, so a parent symlink swap cannot redirect this
+            # size guard to the swapped target's contents.
+            actual = _confined_stat(staging_path).st_size
         except OSError as exc:
             raise _StagingFileChangedError(
                 f"Staging file {staging_path} vanished before append"
@@ -693,12 +873,15 @@ def _read_body(
     # O_NOFOLLOW refuses to open the staging path if it is a symlink, so a
     # leaf-symlink swap between the confinement check and this open is denied
     # at open time (the existing is_symlink pre-check is defense in depth).
+    # When confined, the leaf is also opened RELATIVE to the pinned parent
+    # directory fd, so a parent-directory symlink swap after validation
+    # cannot redirect the write outside the root.
     open_flags = (
         os.O_WRONLY | os.O_CREAT | os.O_APPEND
         if mode == "ab"
         else os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     )
-    fd = os.open(staging_path, open_flags | os.O_NOFOLLOW, 0o644)
+    fd = _open_confined_leaf(staging_path, open_flags, 0o644)
     with os.fdopen(fd, mode) as handle:
         for chunk in response.iter_content(chunk_size=chunk_size):
             if chunk:
@@ -809,14 +992,28 @@ def _enforce_confinement(download_root: Path, *paths: Path) -> None:
     chain escapes the root (directly or through a symlinked directory)
     raises ValueError; this check runs before any mkdir/IO.
 
-    Residual window (accepted trade-off, partial F-F fix): validation-then-open
-    is still check-then-use for the PARENT directory chain. A local attacker
-    who swaps a parent directory for a symlink between this resolve() and the
-    subsequent open() is out of reach for portable stdlib (full closure needs
-    openat2/RESOLVE_NO_SYMLINKS, which is Linux-only). What IS closed: a
-    leaf-substitution race — a symlink swapped in at the staging/manifest
-    path itself after this check — is now refused at open time by
-    O_NOFOLLOW (see _read_body / _record_identity).
+    Symlinked-directory policy (strict): this resolve() check only verifies
+    where the path lands. It does NOT accept symlinked intermediate
+    directories under the root: download_verified additionally rejects any
+    symlinked directory between the root and a confined parent up front
+    (see _assert_no_symlinked_dirs_under_root), because the O_NOFOLLOW parent
+    pinning refuses only a symlink as the FINAL component of the open path
+    and a symlinked intermediate would be followed during traversal — the
+    pin could then capture a different inode than this resolved-path check
+    saw. A symlinked leaf is refused the same way (O_NOFOLLOW at open time).
+    So under confinement, symlinks are rejected at every level.
+
+    Race closure (F-F): this resolve() is validation only; the *open* side of
+    the race is closed two ways. A symlink swapped in at a leaf path
+    (staging/manifest/tmp-sibling) after this check is refused at open time
+    by O_NOFOLLOW (see _read_body / _record_identity). A symlink swapped in at
+    a PARENT directory after this check cannot redirect a write or a
+    metadata operation either: download_verified pins each parent directory
+    to an fd opened with O_NOFOLLOW|O_DIRECTORY before the first write, and
+    the confined leaf-opens, stats, unlinks and manifest renames all resolve
+    against that fd (see _open_confined_leaf / _confined_stat /
+    _confined_unlink), so they land on the validated directory inode and a
+    swapped parent fails the operation instead of escaping the root.
     """
     root = download_root.resolve()
     for path in paths:
@@ -886,13 +1083,20 @@ def _verified_attempt(
     """
     conflict_restarts = 0
     while True:
-        partial_size = staging_path.stat().st_size if staging_path.is_file() else 0
+        # Both checks resolve through the pinned parent fd when confined,
+        # so a parent symlink swap cannot make the size read and the
+        # existence check disagree (or point at the swapped target).
+        partial_size = (
+            _confined_stat(staging_path).st_size
+            if _confined_is_file(staging_path)
+            else 0
+        )
         recorded = _verified_identity(manifest_path)
         if _resume_decision(recorded, current, partial_size, expected_size):
             logger.warning(
                 "Discarding %s: source identity not reconciled", staging_path
             )
-            staging_path.unlink(missing_ok=True)
+            _confined_unlink(staging_path)
             partial_size = 0
         _record_identity(manifest_path, current, complete=False)
         resumed = False
@@ -910,10 +1114,10 @@ def _verified_attempt(
                 )
                 # Close without draining (see docstring); then restart.
                 response.close()
-                staging_path.unlink(missing_ok=True)
+                _confined_unlink(staging_path)
                 continue
             if action == "fail":
-                staging_path.unlink(missing_ok=True)
+                _confined_unlink(staging_path)
                 return resumed, fail_class
             if action == "raise":
                 response.raise_for_status()
@@ -956,7 +1160,7 @@ def _verified_attempt(
                     )
                     # Close without draining (see docstring); then restart.
                     response.close()
-                    staging_path.unlink(missing_ok=True)
+                    _confined_unlink(staging_path)
                     continue
             mode = "ab" if response.status_code == 206 else "wb"
             if mode == "ab":
@@ -981,7 +1185,7 @@ def _verified_attempt(
                 )
                 # Close without draining (see docstring); then restart.
                 response.close()
-                staging_path.unlink(missing_ok=True)
+                _confined_unlink(staging_path)
                 continue
         # The download is byte-complete but NOT yet verified: the final
         # size check runs in download_verified, which owns the complete
@@ -1082,6 +1286,16 @@ def download_verified(
         )
         if staging_path.is_symlink():
             raise ValueError(f"Staging path {staging_path} is a symlink")
+        # Strict symlink-parent policy: any symlinked directory between the
+        # root and a confined parent is rejected up front. The O_NOFOLLOW
+        # parent pinning only refuses a symlink as the final component of
+        # the open path; a symlinked intermediate would be followed during
+        # traversal, so the pin could capture a different inode than the
+        # resolved-path validation above saw. Rejecting it here keeps
+        # _enforce_confinement and the pinning checks consistent.
+        _assert_no_symlinked_dirs_under_root(
+            download_root, staging_path.parent, manifest_path.parent
+        )
     else:
         logger.warning(
             "download_verified without download_root; path confinement "
@@ -1094,6 +1308,20 @@ def download_verified(
     last_error_class: str | None = None
     last_error_message: str | None = None
     assert session is not None  # narrowed by own_session branch above
+    # Confined leaf-opens are bound to the pinned parent-directory fds below
+    # so a parent-directory symlink swap after _enforce_confinement cannot
+    # redirect a write outside the root. The staging parent and the manifest
+    # parent are both pinned (they are the same directory unless a custom
+    # identity_manifest_path places the manifest elsewhere), so every leaf
+    # write resolves against a real directory inode. Both are closed and the
+    # contextvar reset in the finally block at the end of this function.
+    pinned_dirs: dict[Path, int] | None = None
+    confined_token = None
+    if download_root is not None:
+        pinned_dirs = _open_confined_parent_dirs(
+            staging_path.parent, manifest_path.parent
+        )
+        confined_token = _confined_dirs.set(pinned_dirs)
     # Connection-time peer guard: the allowed-local set is the initial
     # hostname only (when local access was opted in), so a rebinding resolver
     # cannot turn a hostname into an internal peer.
@@ -1208,6 +1436,14 @@ def download_verified(
                 remote_identity=current,
             )
     finally:
+        # Release the pinned parent-directory fds and reset the confinement
+        # contextvar (both no-ops when confinement was disabled). Done before
+        # the session close so no leaf write can outlive the pin.
+        if pinned_dirs is not None:
+            for fd in pinned_dirs.values():
+                os.close(fd)
+        if confined_token is not None:
+            _confined_dirs.reset(confined_token)
         if own_session and session is not None:
             session.close()
     final_path = staging_path if staging_path.is_file() else None
@@ -1233,10 +1469,13 @@ def _stat_size(path: Path) -> int:
 
     Final verification and failure reporting run outside the per-attempt
     error guard; a stat failure there must not violate "errors never
-    escape".
+    escape". When confinement is still active (the ContextVar is reset in
+    ``download_verified``'s finally only after the exhaustion report), the
+    stat resolves through the pinned parent fd like every other confined
+    leaf operation; otherwise it is a plain ``path.stat()``.
     """
     try:
-        return path.stat().st_size
+        return _confined_stat(path).st_size
     except OSError:
         return 0
 
@@ -1305,9 +1544,17 @@ def download_files(
 
         # Check if file exists
         if skip_existing and local_path.is_file():
+            # Verify size match via HEAD request on a fresh session carrying
+            # the SAME SSRF guards as the GET path below: a module-level
+            # requests.head() would bypass the peer guard and URL policy
+            # (loopback/private reachable), so this HEAD must go through the
+            # guarded session or the skip check itself is an SSRF hole.
+            head_session = requests.Session()
+            _install_peer_check(head_session, frozenset())
+            _install_url_policy(head_session)
             try:
                 # Verify size match via HEAD request
-                head_response = requests.head(
+                head_response = head_session.head(
                     url, timeout=timeout, allow_redirects=True
                 )
                 remote_size = int(head_response.headers.get("Content-Length", "-1"))
@@ -1319,6 +1566,8 @@ def download_files(
             except Exception:
                 # If HEAD fails, assume file exists and skip
                 return True, True
+            finally:
+                head_session.close()
 
         # Prepare temp path
         temp_path = local_path.with_suffix(local_path.suffix + partial_ext)
