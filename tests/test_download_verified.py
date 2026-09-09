@@ -1895,6 +1895,86 @@ def test_install_peer_check_preserves_pre_mounted_adapter_config():
     assert served_http._pool_maxsize == 9
 
 
+def test_install_peer_check_preserves_pool_block():
+    # A caller's bounded-pool adapter (pool_block=True) must keep its
+    # bounded behavior through the peer-guard install: requests stores the
+    # constructor pool_block value on the adapter as _pool_block, and
+    # _preserved_adapter_config carries it into the replacement.
+    session = requests.Session()
+    session.mount("https://", HTTPAdapter(pool_block=True, pool_maxsize=1))
+    _install_peer_check(session, frozenset())
+    served = session.get_adapter("https://")
+    assert isinstance(served, _PeerCheckedHTTPAdapter)
+    assert served._pool_block is True
+    assert served._pool_maxsize == 1
+
+
+def test_install_peer_check_reinstall_preserves_pool_block():
+    # P1: re-installing the peer guard on a session whose mounted adapter is
+    # ALREADY a _PeerCheckedHTTPAdapter from an earlier install must carry
+    # the prior adapter's pool config forward (read back via
+    # _preserved_adapter_config) — not downgrade a bounded pool to the
+    # fresh-session defaults.
+    session = requests.Session()
+    _install_peer_check(session, frozenset())
+    first = session.get_adapter("https://")
+    # First install carries the session built-in adapter's config
+    # (default pool_block=False); re-install with the bounded-pool
+    # variant directly mounted so the re-install branch (previous
+    # _PeerCheckedHTTPAdapter) is what gets read back.
+    session.mount(
+        "https://",
+        _PeerCheckedHTTPAdapter(
+            frozenset(), max_retries=2, pool_maxsize=2, pool_block=True
+        ),
+    )
+    _install_peer_check(session, frozenset())
+    served = session.get_adapter("https://")
+    assert isinstance(served, _PeerCheckedHTTPAdapter)
+    # A FRESH adapter replaced the mounted one (no in-place reuse) ...
+    assert served is not first
+    # ... and the bounded-pool config carried forward across the re-install.
+    assert served._pool_block is True
+    assert served._pool_maxsize == 2
+
+
+def test_install_peer_check_non_http_adapter_defaults_pool_block_false():
+    # P2: a mounted adapter that is NOT an HTTPAdapter (bare BaseAdapter
+    # subclass — custom transport / test double) has no _pool_block
+    # attribute, so the fallback branch of _preserved_adapter_config must
+    # default pool_block to False with the standard pool sizes (10/10) —
+    # not a getattr-default flip to True that would silently bound the
+    # pool on a caller session with a custom transport.
+    from requests.adapters import BaseAdapter
+
+    class _BareAdapter(BaseAdapter):
+        pass
+
+    session = requests.Session()
+    session.mount("http://", _BareAdapter())
+    _install_peer_check(session, frozenset())
+    served = session.get_adapter("http://")
+    assert isinstance(served, _PeerCheckedHTTPAdapter)
+    assert served._pool_block is False
+    assert served._pool_connections == 10
+    assert served._pool_maxsize == 10
+
+
+def test_install_peer_check_preserves_pool_block_false_default():
+    # P2: an HTTPAdapter mounted WITHOUT an explicit pool_block (the common
+    # case) carries requests' default _pool_block=False. _preserved_adapter_config
+    # reads it via getattr(adapter, "_pool_block", False) — if that default
+    # flipped to True, every caller session with a plain HTTPAdapter would
+    # get a silently bounded pool after the peer-guard install.
+    session = requests.Session()
+    session.mount("https://", HTTPAdapter(pool_maxsize=3))
+    _install_peer_check(session, frozenset())
+    served = session.get_adapter("https://")
+    assert isinstance(served, _PeerCheckedHTTPAdapter)
+    assert served._pool_block is False
+    assert served._pool_maxsize == 3
+
+
 def test_install_peer_check_reinstall_refreshes_direct_pool_classes():
     # D1: the allowed-local set is baked into the guarded connection classes
     # at pool-manager construction (init_poolmanager), so merely refreshing

@@ -495,6 +495,7 @@ class _PeerCheckedHTTPAdapter(HTTPAdapter):
         max_retries: Retry | int | None = None,
         pool_connections: int = 10,
         pool_maxsize: int = 10,
+        pool_block: bool = False,
     ) -> None:
         self._mas_allowed_local = allowed_local
         # Transport config is forwarded to HTTPAdapter.__init__ so an adapter
@@ -505,6 +506,7 @@ class _PeerCheckedHTTPAdapter(HTTPAdapter):
             max_retries=max_retries,
             pool_connections=pool_connections,
             pool_maxsize=pool_maxsize,
+            pool_block=pool_block,
         )
 
     def _guarded_pool_classes(self) -> dict[str, type]:
@@ -588,20 +590,23 @@ class _PeerCheckedHTTPAdapter(HTTPAdapter):
 
 def _preserved_adapter_config(
     adapter: object,
-) -> tuple[Retry | int | None, int, int]:
+) -> tuple[Retry | int | None, int, int, bool]:
     """Read the transport config off a scheme's mounted adapter.
 
-    Returns ``(max_retries, pool_connections, pool_maxsize)`` so the
-    peer-checked adapter that replaces it keeps the same transport behavior
-    (see :func:`_install_peer_check`). A :class:`HTTPAdapter` (including a
-    previous :class:`_PeerCheckedHTTPAdapter`) carries its config on itself:
-    the requests built-in adapter for a scheme holds ``Retry(0, read=False)``,
-    which round-trips unchanged through ``HTTPAdapter.__init__`` (``from_int``
-    returns a ``Retry`` as-is), so a fresh session's defaults are preserved
-    exactly, while a caller-provided ``HTTPAdapter(max_retries=1)`` keeps its
-    retry budget. Pool settings are stored as ``_pool_connections`` /
-    ``_pool_maxsize`` on the adapter (requests keeps the constructor values,
-    not the urllib3 PoolManager's).
+    Returns ``(max_retries, pool_connections, pool_maxsize, pool_block)`` so
+    the peer-checked adapter that replaces it keeps the same transport
+    behavior (see :func:`_install_peer_check`). A :class:`HTTPAdapter`
+    (including a previous :class:`_PeerCheckedHTTPAdapter`) carries its
+    config on itself: the requests built-in adapter for a scheme holds
+    ``Retry(0, read=False)``, which round-trips unchanged through
+    ``HTTPAdapter.__init__`` (``from_int`` returns a ``Retry`` as-is), so a
+    fresh session's defaults are preserved exactly, while a caller-provided
+    ``HTTPAdapter(max_retries=1)`` keeps its retry budget. Pool settings are
+    stored as ``_pool_connections`` / ``_pool_maxsize`` on the adapter
+    (requests keeps the constructor values, not the urllib3 PoolManager's);
+    ``pool_block`` is likewise preserved from ``_pool_block`` so a caller's
+    bounded-pool behavior is kept (requests stores the constructor
+    ``pool_block`` value on the adapter as ``_pool_block``).
 
     A mounted adapter that is NOT a :class:`HTTPAdapter` (a bare
     :class:`BaseAdapter` subclass, custom transport, or test double, or
@@ -613,12 +618,15 @@ def _preserved_adapter_config(
     """
     if isinstance(adapter, HTTPAdapter):
         max_retries: Retry | int | None = adapter.max_retries
+        pool_block: bool = getattr(adapter, "_pool_block", False)
     else:
         max_retries = DEFAULT_MAX_RETRIES
+        pool_block = False
     return (
         max_retries,
         getattr(adapter, "_pool_connections", 10),
         getattr(adapter, "_pool_maxsize", 10),
+        pool_block,
     )
 
 
@@ -636,8 +644,15 @@ def _install_peer_check(
     scheme, so this install must not silently discard a caller's transport
     config: for each scheme, the replacement peer-checked adapter is
     constructed with the mounted adapter's ``max_retries`` /
-    ``pool_connections`` / ``pool_maxsize`` carried over (see
-    :func:`_preserved_adapter_config`).
+    ``pool_connections`` / ``pool_maxsize`` / ``pool_block`` carried over
+    (see :func:`_preserved_adapter_config`). The replacement is also
+    wholesale: a caller-mounted adapter that is NOT an
+    :class:`HTTPAdapter` (a custom transport / bare :class:`BaseAdapter`
+    subclass) is replaced by the peer-checked adapter and cannot coexist
+    with the connection-time peer guard, which must own the connection
+    class to validate the connected TCP peer; only ``HTTPAdapter`` transport
+    settings (max_retries, pool_connections, pool_maxsize, pool_block) are
+    preserved.
 
     A FRESH :class:`_PeerCheckedHTTPAdapter` is mounted on EVERY install —
     even when the mounted adapter is already a :class:`_PeerCheckedHTTPAdapter`
@@ -671,12 +686,18 @@ def _install_peer_check(
             # connection adapters were found for ...") would be
             # misleading for it.
             adapter = None
-        retries, pool_connections, pool_maxsize = _preserved_adapter_config(adapter)
+        (
+            retries,
+            pool_connections,
+            pool_maxsize,
+            pool_block,
+        ) = _preserved_adapter_config(adapter)
         adapters[prefix] = _PeerCheckedHTTPAdapter(
             allowed_local,
             max_retries=retries,
             pool_connections=pool_connections,
             pool_maxsize=pool_maxsize,
+            pool_block=pool_block,
         )
     for prefix, adapter in adapters.items():
         session.mount(prefix, adapter)
