@@ -8,6 +8,7 @@ import errno
 import http.server
 import json
 import logging
+import os
 import socket
 import threading
 import time
@@ -855,6 +856,50 @@ def test_path_outside_download_root_rejected(tmp_path, fast_policy):
     assert list(root.iterdir()) == []
 
 
+def test_confined_staging_directly_in_download_root_completes(
+    tmp_path, fast_policy, local_http_server
+):
+    # P1: when the staging file sits DIRECTLY in download_root, the pinned
+    # parent IS the root — _open_confined_parent_dirs hands the root's own
+    # fd over as that parent's pin, so the helper must not close it in its
+    # finally (the caller closes every returned fd). The pre-fix helper
+    # closed root_fd unconditionally, so the confined leaf-opens
+    # (os.open(dir_fd=<closed root fd>)) raised EBADF and it escaped
+    # download_verified, violating the "errors never escape" contract.
+    # This layout must complete ok with the staging file and the default
+    # manifest inside the root.
+    root = tmp_path / "root"
+    root.mkdir()
+    staging = root / "media.mp4.partial"
+    with local_http_server() as srv:
+        result = download_verified(
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
+            download_root=root,
+        )
+    assert result.ok
+    assert result.resumed is False
+    assert result.error_class is None
+    assert result.error_message is None
+    assert result.bytes_downloaded == 1000
+    assert result.final_path == staging
+    # The staging file and its default identity manifest are both inside
+    # the root and complete.
+    assert staging.is_file()
+    assert staging.read_bytes() == BODY_1000
+    manifest = _manifest(staging)
+    assert manifest["complete"] is True
+    assert manifest["content_length"] == 1000
+    # Only the staging file and its manifest live in the root.
+    assert {p.name for p in root.iterdir()} == {
+        "media.mp4.partial",
+        "media.mp4.partial.identity.json",
+    }
+
+
 # --- Gap-filling tests: identity-verified resume/restart/size verification ---
 
 
@@ -1598,3 +1643,199 @@ def test_peer_adapter_send_reraises_plain_connection_error(monkeypatch):
     # unwrap did not wrap, re-type, or replace an ordinary failure.
     assert excinfo.value is plain
     assert calls == 1
+
+
+def test_intermediate_symlink_after_precheck_pins_refused(
+    tmp_path, fast_policy, local_http_server, monkeypatch
+):
+    # P0: a single O_NOFOLLOW open of the full parent path only guards the
+    # FINAL component; a symlinked INTERMEDIATE directory under the root is
+    # followed during traversal, so the pinned fd would capture the external
+    # target and every confined write would escape the root. The race: the
+    # upfront _assert_no_symlinked_dirs_under_root passes (sees a real dir),
+    # then the intermediate is swapped for a symlink BEFORE the pin walk
+    # opens it. The pin walk must open each component dir_fd-relative so the
+    # intermediate symlink is refused with ELOOP instead of followed.
+    #
+    # Layout: the pinned parent is root/link/inner; the symlink is `link`,
+    # an INTERMEDIATE component (not the final `inner`), so the pre-fix
+    # final-component O_NOFOLLOW guard does NOT see it. Pre-fix, the open
+    # follows link to the external realdir/inner, pins it, and the download
+    # overwrites the external file (the escape). Post-fix, the per-component
+    # walk refuses `link` with ELOOP before any write. The PRECIOUS-content
+    # assertion is what discriminates the two.
+    root = tmp_path / "root"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    real = outside / "realdir"
+    inner_real = real / "inner"
+    inner_real.mkdir(parents=True)
+    (inner_real / "media.mp4.partial").write_bytes(b"PRECIOUS")
+    # The swap source: root/link is a real dir mirroring the external
+    # layout (pre-check passes); the attacker renames it and plants a
+    # symlink to the external dir at the same name.
+    link = root / "link"
+    (link / "inner").mkdir(parents=True)
+    staging = link / "inner" / "media.mp4.partial"
+
+    def _swapped_precheck(*_args, **_kwargs):
+        # Simulate the race window: the pre-check saw a real dir, then the
+        # attacker swaps it for a symlink before the pin walk opens it.
+        link.rename(link.with_name("link.real"))
+        link.symlink_to(real)
+
+    monkeypatch.setattr(
+        downloader, "_assert_no_symlinked_dirs_under_root", _swapped_precheck
+    )
+    with local_http_server() as srv, pytest.raises(OSError) as excinfo:
+        download_verified(
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
+            download_root=root,
+        )
+    # The symlinked intermediate was refused at open time instead of
+    # followed. ENOTDIR is the Linux expression of O_NOFOLLOW|O_DIRECTORY on a
+    # symlink-to-dir (the link is left unfollowed, then O_DIRECTORY finds a
+    # non-directory); ELOOP is the leaf-style refusal and EISDIR would only
+    # surface if the pin had escaped to the external directory (the pre-fix
+    # behavior this test guards against).
+    assert excinfo.value.errno in (errno.ENOTDIR, errno.ELOOP, errno.EISDIR)
+    # The external target was NOT written through the symlink: the pre-fix
+    # code pinned the external directory and overwrote this file, so the
+    # escape is refused, not silent.
+    assert (inner_real / "media.mp4.partial").read_bytes() == b"PRECIOUS"
+    # Nothing else landed outside the root: the symlinked component was
+    # never pinned, so no leaf write could have resolved against it.
+    assert not (inner_real / "media.mp4.partial.identity.json").exists()
+
+
+# --- Confinement pin-acquisition contract tests (fd leak / contextvar) ----
+
+
+def _fd_count() -> int:
+    return len(os.listdir("/proc/self/fd"))
+
+
+def test_confined_setup_failure_closes_pinned_fds_and_resets_contextvar(
+    tmp_path, fast_policy, local_http_server, monkeypatch
+):
+    # The pin-acquisition block (pinned fds opened + _confined_dirs.set)
+    # moved INSIDE the try/finally of download_verified so that a failure
+    # during session setup — after the fds are pinned and the contextvar
+    # is set — still releases everything. _install_peer_check raising
+    # RuntimeError is not a requests.RequestException/OSError/ValueError,
+    # so it is NOT converted to a structured outcome: it propagates out of
+    # download_verified, but the finally must have run before it escaped
+    # (no fd leak, contextvar reset to its default).
+    root = tmp_path / "root"
+    root.mkdir()
+    staging = root / "media.mp4.partial"
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("simulated adapter-install failure")
+
+    monkeypatch.setattr(downloader, "_install_peer_check", _boom)
+    baseline = _fd_count()
+    with (
+        local_http_server() as srv,
+        pytest.raises(RuntimeError, match="simulated adapter-install failure"),
+    ):
+        download_verified(
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
+            download_root=root,
+        )
+    # No pinned fd leaked: the finally closed every fd the pin walk opened.
+    assert _fd_count() == baseline
+    # The confinement contextvar was reset for the caller context: a later
+    # (or nested) non-confined download must not see a stale parent map.
+    assert downloader._confined_dirs.get() is None
+
+
+def test_confined_parent_walk_failure_closes_all_walk_fds(tmp_path):
+    # A walk failure in _open_confined_parent_dirs (a symlinked component
+    # refused with ENOTDIR/ELOOP) must close EVERY fd the helper opened:
+    # the in-progress walk fds AND the already-pinned parents' fds. Here
+    # the first parent (root/ok) pins successfully, then the second
+    # parent's walk reaches a symlink to a plain FILE and is refused —
+    # without the except-branch rewind, the root/ok pin would leak.
+    root = tmp_path / "root"
+    (root / "ok").mkdir(parents=True)
+    (root / "p2").mkdir()
+    file_target = tmp_path / "outside_file.bin"
+    file_target.write_bytes(b"not a directory")
+    (root / "p2" / "mid").symlink_to(file_target)
+    baseline = _fd_count()
+    with pytest.raises(OSError) as excinfo:
+        downloader._open_confined_parent_dirs(root, root / "ok", root / "p2" / "mid")
+    # ENOTDIR: Linux's O_NOFOLLOW|O_DIRECTORY on a symlink (to anything);
+    # ELOOP: the leaf-style refusal. Either proves the walk refused the
+    # component instead of following it.
+    assert excinfo.value.errno in (errno.ENOTDIR, errno.ELOOP)
+    # The helper's own teardown closed everything it opened, including the
+    # already-pinned root/ok fd — no fd leak on the failure path.
+    assert _fd_count() == baseline
+
+
+def test_confined_parent_walk_depth2_success_holds_only_final_fds(tmp_path):
+    # Success-path fd accounting for a depth-2 walk: each intermediate
+    # component fd is released as soon as the next component opens
+    # (walk_fds.pop() + close), so only the final pin per parent survives.
+    # A depth-2 walk of two parents must therefore hold EXACTLY two open
+    # fds — the two pinned parents — with the root fd and any intermediate
+    # already released by the time the helper returns.
+    root = tmp_path / "root"
+    (root / "d1").mkdir(parents=True)
+    (root / "d2").mkdir()
+    baseline = _fd_count()
+    fds = downloader._open_confined_parent_dirs(root, root / "d1", root / "d2")
+    assert len(fds) == 2
+    # Only the two final pins are live; the root_fd was not handed over
+    # (no parent == root) and no intermediate survived.
+    assert _fd_count() == baseline + 2
+    # Caller-owned pins close cleanly and release everything.
+    for fd in fds.values():
+        os.close(fd)
+    assert _fd_count() == baseline
+
+
+def test_confined_symlinked_download_root_refused(
+    tmp_path, fast_policy, local_http_server
+):
+    # The per-component pin walk opens the ROOT itself with
+    # O_NOFOLLOW|O_DIRECTORY, so a download_root that is itself a symlink
+    # is refused at open time — a new refusal boundary the pre-walk code
+    # (which opened the root's parent or the full parent paths) did not
+    # have. NOTE: the structured-outcome conversion for pin-walk OSErrors
+    # was deferred, so TODAY a raw OSError (ENOTDIR/ELOOP) escapes
+    # download_verified; if a future change converts pin-walk failures to
+    # structured outcomes, update this test's raises-clause to expect the
+    # structured failure instead.
+    realroot = tmp_path / "realroot"
+    (realroot / "inner").mkdir(parents=True)
+    link = tmp_path / "link"
+    link.symlink_to(realroot)
+    staging = link / "inner" / "media.mp4.partial"
+    baseline = _fd_count()
+    with local_http_server() as srv, pytest.raises(OSError) as excinfo:
+        download_verified(
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
+            download_root=link,
+        )
+    assert excinfo.value.errno in (errno.ENOTDIR, errno.ELOOP)
+    # The refusal happened before any write: the real target directory is
+    # untouched (no .partial, no .identity.json) — nothing escaped through
+    # the symlinked root.
+    assert list((realroot / "inner").iterdir()) == []
+    # The escaped failure still went through the finally: no fd leak.
+    assert _fd_count() == baseline

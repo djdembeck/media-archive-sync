@@ -163,27 +163,87 @@ def _open_confined_leaf(leaf: Path, flags: int, mode: int) -> int:
     return os.open(leaf, flags | os.O_NOFOLLOW, mode)
 
 
-def _open_confined_parent_dirs(*parents: Path) -> dict[Path, int]:
-    """Open each parent directory with ``O_NOFOLLOW | O_DIRECTORY``.
+def _open_confined_parent_dirs(root: Path, *parents: Path) -> dict[Path, int]:
+    """Pin each parent directory to an ``O_NOFOLLOW | O_DIRECTORY`` fd.
 
-    Returns ``{parent: fd}`` (de-duplicated). ``O_NOFOLLOW`` on the directory
-    open itself refuses a parent that has become a symlink (ELOOP), and the
-    held fd pins the real directory inode for the lifetime of the download so
-    :func:`_open_confined_leaf` can resolve leaves against it. The caller must
-    ``os.close`` every returned fd (see ``download_verified``). A failure to
-    open a later parent closes the already-opened ones (no fd leak).
+    Every component between ``root`` and a ``parent`` is opened
+    incrementally — the root first, then each remaining component
+    ``os.open``-ed relative to the previous component's fd (``dir_fd``) with
+    ``O_RDONLY | O_DIRECTORY | O_NOFOLLOW``. A single open of the full path
+    would only apply ``O_NOFOLLOW`` to the FINAL component: any intermediate
+    directory symlinked after the upfront checks (or ``root`` itself) would
+    be followed during traversal, so the pinned fd could capture an external
+    directory and every subsequent confined write would escape the root.
+    Walking component by component makes each check-then-use step atomic
+    per component: a symlinked intermediate is refused at the open site
+    (ELOOP, or ENOTDIR on Linux where O_NOFOLLOW|O_DIRECTORY on a
+    symlink-to-dir finds the unfollowed link is not a directory) instead of
+    followed. A component that is a symlink even before the upfront checks
+    ran is caught here too — the pre-check is defense-in-depth, the walk is
+    the race-tight gate.
+
+    Returns ``{parent: fd}`` (de-duplicated; both parents being the same
+    directory pins it once). The held fd pins the real directory inode for
+    the lifetime of the download so :func:`_open_confined_leaf` can resolve
+    leaves against it.
+
+    Fd accounting: intermediate component fds are closed as soon as the
+    next component opens — only the final (pinned) fd per parent is held,
+    so a walk of depth N leaks zero fds of its own. When a pinned parent
+    IS the root, the root's own fd is that parent's pinned fd and is
+    returned to the caller instead of closed here. The caller must
+    ``os.close`` every returned fd — including the root's when it was
+    handed over (see ``download_verified``); otherwise the helper closes
+    its own root fd once every parent is pinned. A failure to open a
+    later parent (or component) closes every fd that walk opened
+    (intermediates plus any newly opened final), in addition to the
+    already-pinned parents' fds (no fd leak on any path).
     """
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    root_fd = os.open(root, flags)
     fds: dict[Path, int] = {}
+    # Intermediate fds of the parent walk currently in progress (see below);
+    # bound before the try so the except handler can always iterate it.
+    walk_fds: list[int] = []
     try:
         for parent in parents:
             if parent not in fds:
-                fds[parent] = os.open(
-                    parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                rel = Path(os.path.abspath(parent)).relative_to(
+                    Path(os.path.abspath(root))
                 )
+                # rel is always relative (root == parent included, where it
+                # is "."): walk it component by component, each open
+                # dir_fd-relative to the component pinned just before it.
+                fd = root_fd
+                for part in rel.parts:
+                    fd = os.open(part, flags, dir_fd=fd)
+                    if walk_fds:
+                        # The previous component is pinned no more: the
+                        # next open (and the final pin) resolves against
+                        # the new fd, so release it immediately.
+                        os.close(walk_fds.pop())
+                    walk_fds.append(fd)
+                # The pinned fd (a just-opened component, or root_fd when
+                # rel.parts is empty) is held by the caller, not by the
+                # walk; drop it from the in-progress set.
+                fds[parent] = fd
+                walk_fds.clear()
     except BaseException:
+        # Close every fd this parent's in-progress walk opened (the
+        # intermediates still held plus the final if it opened);
+        # walk_fds cannot contain root_fd, which the helper closes itself.
+        for fd in walk_fds:
+            os.close(fd)
         for fd in fds.values():
             os.close(fd)
         raise
+    finally:
+        # The root fd is the caller's to close only when it was handed
+        # over as a pinned parent (parent == root); every other path
+        # (including failures — see except — which never leave it pinned)
+        # closes it here.
+        if root_fd not in fds.values():
+            os.close(root_fd)
     return fds
 
 
@@ -245,13 +305,12 @@ def _assert_no_symlinked_dirs_under_root(root: Path, *parents: Path) -> None:
     """Reject a symlinked directory in the chain between ``root`` and each
     ``parent`` (the parent itself included, the root excluded).
 
-    ``_open_confined_parent_dirs`` pins parents with O_NOFOLLOW, which only
-    refuses a symlink as the FINAL component of the open path; a symlinked
-    intermediate directory is followed during path traversal, so the pin
-    could capture a different directory than the one
-    ``_enforce_confinement`` validated by resolved path. Rejecting any
-    symlinked component up front keeps the strict O_NOFOLLOW-pinning
-    policy self-consistent: under confinement, no symlinked directory
+    ``_open_confined_parent_dirs`` pins parents with an incremental
+    per-component O_NOFOLLOW walk, which refuses a symlink at every level —
+    including intermediates — as of the open. This up-front check remains as
+    defense in depth: it rejects the same condition earlier (before any fd is
+    opened) with a named error, and keeps the strict policy self-consistent
+    with ``_enforce_confinement``: under confinement, no symlinked directory
     anywhere between the root and a confined parent.
     """
     abs_root = Path(os.path.abspath(root))
@@ -994,26 +1053,31 @@ def _enforce_confinement(download_root: Path, *paths: Path) -> None:
 
     Symlinked-directory policy (strict): this resolve() check only verifies
     where the path lands. It does NOT accept symlinked intermediate
-    directories under the root: download_verified additionally rejects any
+    directories under the root: the O_NOFOLLOW parent pinning enforces the
+    same policy at open time with an incremental per-component walk (each
+    component opened dir_fd-relative with O_NOFOLLOW), so a symlinked
+    component — intermediate or final — is refused at the open site rather
+    than followed: the pin can never capture a different inode than this
+    resolved-path check saw. download_verified additionally rejects any
     symlinked directory between the root and a confined parent up front
-    (see _assert_no_symlinked_dirs_under_root), because the O_NOFOLLOW parent
-    pinning refuses only a symlink as the FINAL component of the open path
-    and a symlinked intermediate would be followed during traversal — the
-    pin could then capture a different inode than this resolved-path check
-    saw. A symlinked leaf is refused the same way (O_NOFOLLOW at open time).
-    So under confinement, symlinks are rejected at every level.
+    (see _assert_no_symlinked_dirs_under_root), naming the condition early
+    with a ValueError before any fd is opened. A symlinked leaf is refused
+    the same way (O_NOFOLLOW at open time). So under confinement, symlinks
+    are rejected at every level.
 
     Race closure (F-F): this resolve() is validation only; the *open* side of
     the race is closed two ways. A symlink swapped in at a leaf path
     (staging/manifest/tmp-sibling) after this check is refused at open time
-    by O_NOFOLLOW (see _read_body / _record_identity). A symlink swapped in at
-    a PARENT directory after this check cannot redirect a write or a
-    metadata operation either: download_verified pins each parent directory
-    to an fd opened with O_NOFOLLOW|O_DIRECTORY before the first write, and
-    the confined leaf-opens, stats, unlinks and manifest renames all resolve
-    against that fd (see _open_confined_leaf / _confined_stat /
-    _confined_unlink), so they land on the validated directory inode and a
-    swapped parent fails the operation instead of escaping the root.
+    by O_NOFOLLOW (see _read_body / _record_identity). A symlink swapped in
+    at a PARENT directory (or any intermediate under the root) after this
+    check cannot redirect a write or a metadata operation either:
+    download_verified pins each parent directory to an fd before the first
+    write, by an incremental per-component O_NOFOLLOW|O_DIRECTORY walk from
+    the root (see _open_confined_parent_dirs), and the confined leaf-opens,
+    stats, unlinks and manifest renames all resolve against that fd (see
+    _open_confined_leaf / _confined_stat / _confined_unlink), so they land on
+    the validated directory inode and a swapped directory fails the open
+    instead of escaping the root.
     """
     root = download_root.resolve()
     for path in paths:
@@ -1287,12 +1351,12 @@ def download_verified(
         if staging_path.is_symlink():
             raise ValueError(f"Staging path {staging_path} is a symlink")
         # Strict symlink-parent policy: any symlinked directory between the
-        # root and a confined parent is rejected up front. The O_NOFOLLOW
-        # parent pinning only refuses a symlink as the final component of
-        # the open path; a symlinked intermediate would be followed during
-        # traversal, so the pin could capture a different inode than the
-        # resolved-path validation above saw. Rejecting it here keeps
-        # _enforce_confinement and the pinning checks consistent.
+        # root and a confined parent is rejected up front, before any fd is
+        # opened. The O_NOFOLLOW parent pinning enforces the same policy at
+        # open time with an incremental per-component walk (refusing a
+        # symlink at every level, ELOOP), so this up-front check is
+        # defense in depth — but it gives the same condition a named error
+        # early and keeps _enforce_confinement and the pinning consistent.
         _assert_no_symlinked_dirs_under_root(
             download_root, staging_path.parent, manifest_path.parent
         )
@@ -1308,20 +1372,8 @@ def download_verified(
     last_error_class: str | None = None
     last_error_message: str | None = None
     assert session is not None  # narrowed by own_session branch above
-    # Confined leaf-opens are bound to the pinned parent-directory fds below
-    # so a parent-directory symlink swap after _enforce_confinement cannot
-    # redirect a write outside the root. The staging parent and the manifest
-    # parent are both pinned (they are the same directory unless a custom
-    # identity_manifest_path places the manifest elsewhere), so every leaf
-    # write resolves against a real directory inode. Both are closed and the
-    # contextvar reset in the finally block at the end of this function.
     pinned_dirs: dict[Path, int] | None = None
     confined_token = None
-    if download_root is not None:
-        pinned_dirs = _open_confined_parent_dirs(
-            staging_path.parent, manifest_path.parent
-        )
-        confined_token = _confined_dirs.set(pinned_dirs)
     # Connection-time peer guard: the allowed-local set is the initial
     # hostname only (when local access was opted in), so a rebinding resolver
     # cannot turn a hostname into an internal peer.
@@ -1331,9 +1383,25 @@ def download_verified(
         if allow_local and initial_hostname
         else frozenset()
     )
-    _install_peer_check(session, allowed_local)
-    _install_url_policy(session, allow_local=allow_local)
     try:
+        # The pinned parent-directory fds are acquired INSIDE this
+        # try/finally: if adapter installation or anything else below raises
+        # before the main body, the finally still closes every opened fd and
+        # resets the contextvar, so no fd leaks and _confined_dirs is never
+        # left set for a caller context. Confined leaf-opens are bound to
+        # these fds so a parent-directory symlink swap after
+        # _enforce_confinement cannot redirect a write outside the root. The
+        # staging parent and the manifest parent are both pinned (they are
+        # the same directory unless a custom identity_manifest_path places
+        # the manifest elsewhere), so every leaf write resolves against a
+        # real directory inode.
+        if download_root is not None:
+            pinned_dirs = _open_confined_parent_dirs(
+                download_root, staging_path.parent, manifest_path.parent
+            )
+            confined_token = _confined_dirs.set(pinned_dirs)
+        _install_peer_check(session, allowed_local)
+        _install_url_policy(session, allow_local=allow_local)
         # The initial URL is operator-chosen; whether its loopback/private/
         # link-local targets are permitted is the caller's allow_local
         # decision. Redirect hops are validated strictly by the session hook
