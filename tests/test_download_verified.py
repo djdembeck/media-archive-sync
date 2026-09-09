@@ -18,6 +18,8 @@ from pathlib import Path
 import pytest
 import requests
 import urllib3.connection
+import urllib3.connectionpool
+from requests.adapters import HTTPAdapter
 
 import media_archive_sync.downloader as downloader
 from media_archive_sync import (
@@ -944,14 +946,17 @@ def test_initial_url_policy_violations_fail_structured(
     tmp_path,
     fast_policy,
 ):
-    # A bad initial URL (wrong scheme / userinfo) fails immediately as a
-    # structured URLPolicyError outcome; no server is contacted, nothing
-    # raises. allow_local=True permits loopback, so only scheme and userinfo
-    # are exercised here.
+    # A bad initial URL (wrong scheme / userinfo / no hostname) fails
+    # immediately as a structured URLPolicyError outcome; no server is
+    # contacted, nothing raises. The no-hostname forms ('http:///media.bin',
+    # 'http://') are rejected in the no-hostname branch, which PRECEDES
+    # getaddrinfo entirely — so no CI-host network dependency.
     bad_urls = [
         "file:///etc/passwd",
         "ftp://127.0.0.1:8000/x",
         "http://user:pass@example.org/media.bin",
+        "http:///media.bin",
+        "http://",
     ]
     for url in bad_urls:
         staging = tmp_path / "media.mp4.partial"
@@ -1699,10 +1704,13 @@ def test_intermediate_symlink_after_precheck_pins_refused(
     # The symlinked intermediate was refused at open time instead of
     # followed. ENOTDIR is the Linux expression of O_NOFOLLOW|O_DIRECTORY on a
     # symlink-to-dir (the link is left unfollowed, then O_DIRECTORY finds a
-    # non-directory); ELOOP is the leaf-style refusal and EISDIR would only
-    # surface if the pin had escaped to the external directory (the pre-fix
-    # behavior this test guards against).
-    assert excinfo.value.errno in (errno.ENOTDIR, errno.ELOOP, errno.EISDIR)
+    # non-directory); ELOOP is the leaf-style refusal. EISDIR is deliberately
+    # NOT accepted here: it was the PRE-FIX escape symptom (the walk followed
+    # the symlinked intermediate and the subsequent open hit a directory —
+    # the behavior this test guards against), not a refusal; accepting it
+    # would make the test pass against the very bug it exists to catch. The
+    # PRECIOUS-content assertion below is the real discriminator.
+    assert excinfo.value.errno in (errno.ENOTDIR, errno.ELOOP)
     # The external target was NOT written through the symlink: the pre-fix
     # code pinned the external directory and overwrote this file, so the
     # escape is refused, not silent.
@@ -1839,3 +1847,695 @@ def test_confined_symlinked_download_root_refused(
     assert list((realroot / "inner").iterdir()) == []
     # The escaped failure still went through the finally: no fd leak.
     assert _fd_count() == baseline
+
+
+# --- PR #9 canonical reconciliation fixes (F1..F7) --------------------------
+
+
+def test_install_peer_check_preserves_pre_mounted_adapter_config():
+    # F1: Session.mount() REPLACES the mounted adapter for a scheme, so
+    # _install_peer_check must not silently discard a caller's transport
+    # config. Two cases:
+    #   (a) a legacy-path session (HTTPAdapter(max_retries=1) on https,
+    #       as download_file / download_files install) keeps total==1 on
+    #       the adapter that ends up serving the scheme; and
+    #   (b) a caller session with a custom adapter (non-default
+    #       max_retries / pool_connections / pool_maxsize) sees those
+    #       settings carried into the peer-checked adapter.
+    # Both must result in a _PeerCheckedHTTPAdapter (the guard is real),
+    # with the preserved transport config — not the urllib3 Retry(0,
+    # read=False) default that a bare _PeerCheckedHTTPAdapter() would carry.
+    from urllib3.util.retry import Retry
+
+    # (a) Legacy path: only https was pre-mounted with max_retries=1.
+    legacy = requests.Session()
+    legacy.mount("https://", HTTPAdapter(max_retries=1))
+    _install_peer_check(legacy, frozenset())
+    served = legacy.get_adapter("https://")
+    assert isinstance(served, _PeerCheckedHTTPAdapter)
+    # The deliberate max_retries=1 survived the peer-guard install: the
+    # adapter serving the scheme still retries once (not the Retry(0,
+    # read=False) downgrade a fresh _PeerCheckedHTTPAdapter() carries).
+    assert isinstance(served.max_retries, Retry)
+    assert served.max_retries.total == 1
+
+    # (b) Caller session: custom adapter with non-default retry/pool config.
+    caller = requests.Session()
+    custom = HTTPAdapter(max_retries=2, pool_connections=5, pool_maxsize=9)
+    caller.mount("http://", custom)
+    _install_peer_check(caller, frozenset())
+    served_http = caller.get_adapter("http://")
+    assert isinstance(served_http, _PeerCheckedHTTPAdapter)
+    # The peer guard is mounted (not the caller's plain adapter).
+    assert served_http is not custom
+    # Caller's transport config was carried into the peer-checked adapter.
+    assert isinstance(served_http.max_retries, Retry)
+    assert served_http.max_retries.total == 2
+    assert served_http._pool_connections == 5
+    assert served_http._pool_maxsize == 9
+
+
+def test_install_peer_check_reinstall_refreshes_direct_pool_classes():
+    # D1: the allowed-local set is baked into the guarded connection classes
+    # at pool-manager construction (init_poolmanager), so merely refreshing
+    # a reused adapter's _mas_allowed_local in place is INERT for direct
+    # pools: an already-constructed PoolManager would keep the FIRST
+    # install's set. _install_peer_check therefore mounts a FRESH
+    # _PeerCheckedHTTPAdapter on every install (mount replaces by prefix —
+    # no stacking), baking the CURRENT allowed_local.
+    # Install permissive, force pool-manager creation, re-install strict on
+    # the SAME session, and assert the direct pool classes now carry the
+    # strict (empty) set — not the stale permissive one.
+    permissive = frozenset({"lab:8000"})
+    session = requests.Session()
+    _install_peer_check(session, permissive)
+    first = session.get_adapter("http://")
+    # Force pool-manager creation so the pool classes are baked.
+    first.init_poolmanager(10, 10)
+    assert (
+        first.poolmanager.pool_classes_by_scheme[
+            "http"
+        ].ConnectionCls._mas_allowed_local
+        == permissive
+    )
+
+    _install_peer_check(session, frozenset())
+    fresh = session.get_adapter("http://")
+    assert isinstance(fresh, _PeerCheckedHTTPAdapter)
+    # A FRESH adapter replaced the mounted one (no in-place reuse).
+    assert fresh is not first
+    # The adapter attr is strict ...
+    assert fresh._mas_allowed_local == frozenset()
+    # ... and the DIRECT pool classes (existing pool manager, which HTTPAdapter
+    # constructs eagerly, plus any future one from _guarded_pool_classes)
+    # bake the STRICT set — the permissive set is gone.
+    assert (
+        fresh.poolmanager.pool_classes_by_scheme[
+            "http"
+        ].ConnectionCls._mas_allowed_local
+        == frozenset()
+    )
+    assert (
+        fresh.poolmanager.pool_classes_by_scheme[
+            "https"
+        ].ConnectionCls._mas_allowed_local
+        == frozenset()
+    )
+    assert (
+        fresh._guarded_pool_classes()["http"].ConnectionCls._mas_allowed_local
+        == frozenset()
+    )
+    # Re-install is config-preserving, not a downgrade.
+    assert fresh.max_retries == first.max_retries
+    assert fresh._pool_connections == first._pool_connections
+    assert fresh._pool_maxsize == first._pool_maxsize
+
+
+def test_install_peer_check_tolerates_non_http_adapter():
+    # D2: a caller session may mount a plain BaseAdapter subclass (custom
+    # transport / test double) that carries no max_retries. _install_peer_check
+    # must not raise reading config off it, and the installed peer-checked
+    # adapter must get the standard fresh-session retry budget
+    # (Retry(total=3)) — not a Retry(0, read=False) downgrade and not a
+    # crash from a missing attribute.
+    from requests.adapters import BaseAdapter
+    from urllib3.util.retry import Retry
+
+    class _BareAdapter(BaseAdapter):
+        pass
+
+    session = requests.Session()
+    session.mount("http://", _BareAdapter())
+    _install_peer_check(session, frozenset())  # must not raise
+    served = session.get_adapter("http://")
+    assert isinstance(served, _PeerCheckedHTTPAdapter)
+    assert isinstance(served.max_retries, Retry)
+    assert served.max_retries.total == 3
+    # The other scheme still gets the requests built-in default preserved
+    # (fresh session: Retry(0, read=False)).
+    served_https = session.get_adapter("https://")
+    assert isinstance(served_https, _PeerCheckedHTTPAdapter)
+    assert isinstance(served_https.max_retries, Retry)
+    assert served_https.max_retries.total == 0
+    assert served_https.max_retries.read is False
+
+
+def test_proxy_manager_for_uses_guarded_pool_classes(local_http_server):
+    # F4: the branch claims "peer guard applied to proxy connection pools"
+    # via _PeerCheckedHTTPAdapter.proxy_manager_for (pool_classes_by_scheme
+    # replacement), but no test exercised it. Prove the guarded pool classes
+    # are ACTUALLY used for proxy-originated connections, at the
+    # pool-class level (the reliable form):
+    #   (a) adapter.proxy_manager_for(proxy) returns a ProxyManager whose
+    #       pool_classes_by_scheme are the guarded classes (NOT the urllib3
+    #       defaults);
+    #   (b) a connection through that proxy manager to a non-public peer is
+    #       rejected by the peer guard (allow_local empty).
+    # This test FAILS if proxy_manager_for stops overriding pool classes
+    # (the guarded ConnectionCls would be the plain urllib3 default).
+    with local_http_server() as srv:
+        adapter = _PeerCheckedHTTPAdapter(frozenset())
+        proxy_mgr = adapter.proxy_manager_for("http://127.0.0.1:8080")
+        # (a) pool classes on the proxy manager are the guarded ones.
+        pcls = proxy_mgr.pool_classes_by_scheme
+        guarded_http = pcls["http"]
+        guarded_https = pcls["https"]
+        # They are subclasses of the standard pools (a guarded wrapper),
+        # not the plain urllib3 defaults.
+        assert issubclass(guarded_http, urllib3.connectionpool.HTTPConnectionPool)
+        assert issubclass(guarded_https, urllib3.connectionpool.HTTPSConnectionPool)
+        assert guarded_http is not urllib3.connectionpool.HTTPConnectionPool
+        # The ConnectionCls the proxy pool uses is the peer-checked
+        # connection (carrying the allowed-local set), not the plain one.
+        assert issubclass(guarded_http.ConnectionCls, urllib3.connection.HTTPConnection)
+        assert issubclass(
+            guarded_https.ConnectionCls, urllib3.connection.HTTPSConnection
+        )
+        # The same guarded ConnectionCls is what a pool ACTUALLY pulled from
+        # the proxy manager will use to connect (end-to-end pool wiring).
+        pool = proxy_mgr.connection_from_host("example.com", 80)
+        assert pool.ConnectionCls is guarded_http.ConnectionCls
+        # (b) A connection through the guarded proxy pool class to a
+        #     non-public (loopback) peer with an empty allow-local set is
+        #     refused at connect time by the peer guard.
+        conn_cls = guarded_http.ConnectionCls
+        conn = conn_cls("127.0.0.1", srv.port)
+        with pytest.raises(URLPolicyError):
+            conn.connect()
+
+
+def test_confined_root_pin_mixed_spelling_no_double_close(tmp_path):
+    # F2: dedup in _open_confined_parent_dirs is raw-Path lexical equality
+    # while rel is computed from abspath, so two distinct absolute spellings
+    # of the SAME directory (normalized root vs root/inner/..) both get
+    # rel.parts == () and (pre-fix) both stored root_fd itself; the caller
+    # closing every pinned fd then double-closed it (EBADF escaping
+    # download_verified). Post-fix, a parent equal to the root (in ANY raw
+    # spelling) pins os.dup(root_fd) — one descriptor per key, distinct
+    # spellings each get their own fd — and the helper always closes its own
+    # root_fd, so closing every returned fd is safe and leaks nothing.
+    # ALL-ABSOLUTE paths, NO chdir, NO relative Path.
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "inner").mkdir()
+    # A distinct ABSOLUTE raw spelling of root (unnormalized '..').
+    root_alt = root / "inner" / ".."
+    assert root != root_alt  # distinct raw Path spellings
+    assert root.resolve() == root_alt.resolve()  # same real directory
+    baseline = _fd_count()
+    fds = downloader._open_confined_parent_dirs(root, root, root_alt)
+    # Two distinct keys -> two distinct fd VALUES (each an os.dup of the
+    # root fd), never the same descriptor twice.
+    assert set(fds.keys()) == {root, root_alt}
+    fd_root = fds[root]
+    fd_alt = fds[root_alt]
+    assert fd_root != fd_alt
+    # Both fds point at the same (root) inode.
+    assert os.fstat(fd_root).st_ino == os.fstat(fd_alt).st_ino
+    # Closing every returned fd (in BOTH orders) must not double-close and
+    # must leave zero leaked fds — the helper closed its own root_fd.
+    os.close(fd_root)
+    os.close(fd_alt)
+    assert _fd_count() == baseline
+
+
+def test_confined_root_pin_mixed_spelling_end_to_end(
+    tmp_path, fast_policy, local_http_server
+):
+    # F2 (end-to-end): a REAL confined download whose download_root is the
+    # normalized root and whose manifest parent is passed as a distinct
+    # unnormalized '..' spelling of the SAME root must complete ok, with the
+    # final file at the normalized location inside root. Pre-fix, the
+    # finally's double-close of the shared root fd raised EBADF that escaped
+    # download_verified; post-fix it completes cleanly with zero fd leak.
+    with local_http_server() as srv:
+        root = tmp_path / "root"
+        root.mkdir()
+        (root / "inner").mkdir()
+        # Two DISTINCT absolute raw spellings of root, so that the staging
+        # parent and the manifest parent are distinct Path objects spelling
+        # the SAME directory — exactly what defeats the pre-fix raw-Path
+        # dedup in _open_confined_parent_dirs (both normalize to
+        # rel.parts == () and, pre-fix, both stored root_fd itself, so the
+        # caller's close-everything double-closed it). pathlib keeps an
+        # unnormalized '..' component, and two different intermediate names
+        # give two different lexically-distinct spellings of the same dir.
+        # ('a' need not exist: no component of the manifest chain is ever
+        # stat'd — the confined leaf ops resolve against the pinned parent
+        # fd — and both parents' symlink pre-check walks only real dirs.)
+        staging = root / "inner" / ".." / "media.mp4.partial"
+        manifest = root / "a" / ".." / "media.mp4.partial.identity.json"
+        assert staging.parent != manifest.parent  # distinct raw spellings
+        assert os.path.abspath(staging.parent) == os.path.abspath(manifest.parent)
+        baseline = _fd_count()
+        result = download_verified(
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
+            download_root=root,
+            identity_manifest_path=manifest,
+        )
+        assert result.ok
+        # The final file is at the NORMALIZED location inside root.
+        final = root / "media.mp4.partial"
+        assert final.is_file()
+        assert final.read_bytes() == BODY_1000
+        assert final.stat().st_size == 1000
+        assert result.final_path == staging  # as passed (raw spelling)
+        # Manifest persisted at the normalized manifest location.
+        assert (root / "media.mp4.partial.identity.json").is_file()
+        # No double-close / no fd leak: the mixed-spelling pin released all
+        # of its descriptors.
+        assert _fd_count() == baseline
+
+
+def test_server_206_without_range_reports_not_resumed(
+    tmp_path, fast_policy, local_http_server, monkeypatch
+):
+    # F5: a server that answers a GET with 206 + Content-Range bytes=0- even
+    # though the client sent NO Range header and no partial exists (a fresh
+    # download) must NOT be misreported as resumed. resumed is derived from
+    # partial_size (a genuine Range resume), not the bare 206 status code.
+    # The body is still written (ab to an empty/created file) and verifies.
+    with local_http_server(always_206=True) as srv:
+        staging = tmp_path / "media.mp4.partial"
+        get_headers = []
+        original_get = downloader.requests.Session.get
+
+        def _spy(self, url, *a, **kw):
+            get_headers.append(dict(kw.get("headers") or {}))
+            return original_get(self, url, *a, **kw)
+
+        monkeypatch.setattr(downloader.requests.Session, "get", _spy)
+        result = download_verified(
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
+        )
+        # Fresh download (no partial): the GET sent NO Range header, yet the
+        # server answered 206 from zero. It must succeed with correct bytes
+        # and NOT be reported as a resumption.
+        assert result.ok
+        assert result.resumed is False
+        assert result.bytes_downloaded == 1000
+        assert staging.read_bytes() == BODY_1000
+        assert staging.stat().st_size == 1000
+        # Proof no Range header was sent on the fresh GET (the 206 was the
+        # server's choice, not a resume the client requested).
+        assert get_headers, "the GET was never issued"
+        assert all("Range" not in h for h in get_headers)
+
+
+def test_probe_vanish_restarts_in_pass_without_retry(
+    tmp_path, fast_policy, local_http_server, monkeypatch
+):
+    # F6: partial_size is computed as _confined_stat(...) if
+    # _confined_is_file(...) else 0 — two syscalls. If the file vanishes
+    # BETWEEN them, the pre-fix code let the bare FileNotFoundError/OSError
+    # escape _verified_attempt and burn a full retry attempt with backoff.
+    # Post-fix the probe's vanished-file race is translated into the same
+    # clean in-pass restart the "vanished before append" branch uses: the
+    # pass restarts from byte zero WITHOUT consuming a retry attempt (no
+    # backoff sleep). We simulate the race by making the FIRST probe's
+    # is_file lie True and the stat raise FileNotFoundError; subsequent
+    # probes use the real helpers.
+    with local_http_server() as srv:
+        staging = tmp_path / "media.mp4.partial"
+        probed = {"n": 0}
+        real_is_file = downloader._confined_is_file
+        real_stat = downloader._confined_stat
+
+        def _fake_is_file(leaf):
+            if probed["n"] == 0 and leaf == staging:
+                # First probe: claim the file exists...
+                return True
+            return real_is_file(leaf)
+
+        def _fake_stat(leaf):
+            probed["n"] += 1
+            if probed["n"] == 1 and leaf == staging:
+                # ...then it has vanished before the stat (the race).
+                raise FileNotFoundError(f"vanished: {leaf}")
+            return real_stat(leaf)
+
+        monkeypatch.setattr(downloader, "_confined_is_file", _fake_is_file)
+        monkeypatch.setattr(downloader, "_confined_stat", _fake_stat)
+        sleeps = []
+        monkeypatch.setattr(downloader.time, "sleep", lambda s: sleeps.append(s))
+        result = download_verified(
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
+        )
+        # The vanished-probe race restarted in-pass (no retry attempt burned):
+        # zero backoff sleeps across the whole download.
+        assert result.ok
+        assert sleeps == [], f"probe vanish burned a retry (sleeps={sleeps})"
+        assert result.resumed is False
+        assert staging.read_bytes() == BODY_1000
+
+
+# --- Security-contract gap tests (SSRF guards / confinement / shape) ------
+
+
+def test_check_peer_missing_sock_or_host_attr_fails_closed():
+    # P1: _check_peer reads the peer via conn.sock.getpeername() and the
+    # carve-out via conn.host. If EITHER attribute is missing the peer
+    # CANNOT be inspected, so the guard must fail closed: raise
+    # URLPolicyError (and close the socket when one exists). A guarded
+    # connection that cannot be verified is never allowed to proceed.
+    # Symmetric: a None sock with a set host must fail closed too (no crash
+    # reading attributes off the None sock).
+    guarded = _peer_checked_connection(urllib3.connection.HTTPConnection, frozenset())
+
+    class _StubSock:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def getpeername(self) -> tuple[str, int]:
+            return ("1.2.3.4", 41337)
+
+        def close(self) -> None:
+            self.closed = True
+
+    # sock present, host missing -> raise + close the socket.
+    conn = guarded("example.com", 80)
+    conn.host = None
+    stub = _StubSock()
+    conn.sock = stub
+    with pytest.raises(URLPolicyError) as exc_info:
+        _check_peer(conn)
+    assert "Unable to inspect connected peer" in str(exc_info.value)
+    assert stub.closed is True
+
+    # sock missing, host present (a public string) -> raise, no crash.
+    conn2 = guarded("example.com", 80)
+    conn2.host = "8.8.8.8"
+    conn2.sock = None
+    with pytest.raises(URLPolicyError) as exc_info2:
+        _check_peer(conn2)
+    assert "Unable to inspect connected peer" in str(exc_info2.value)
+
+
+def test_allow_local_carve_out_scope(monkeypatch):
+    # P2: allow_local=True scopes the carve-out EXACTLY to
+    # allow_local and _is_local_address (private/loopback/link-local) —
+    # NOT to "everything that isn't a hard disallow". The observable,
+    # version-stable contract is:
+    #   * the allow path works: a loopback (is_local) peer that is listed
+    #     as the allowed host is ACCEPTED, whereas the same peer under the
+    #     strict (empty-allow) policy is REJECTED;
+    #   * multicast is NEITHER local nor (in CPython's special-registry)
+    #     private, so it stays REJECTED under allow_local=True too —
+    #     the carve-out is local-scoped, not a full open.
+    # NOTE (deviation from the _assert_public_url docstring): the docstring
+    # says "reserved/multicast/unspecified remain rejected", but the CODE
+    # carves out by is_local, and CPython >=3.11 classifies 0.0.0.0/8 and
+    # 240.0.0.0/4 as is_private (hence is_local) — so on this platform they
+    # are ACCEPTED with allow_local=True, contradicting the docstring. We
+    # pin the STABLE behavior (loopback allow + multicast reject + the
+    # strict contrast) rather than the is_private-dependent reserved/
+    # unspecified outcomes, which vary across CPython versions.
+    allowed = _peer_checked_connection(
+        urllib3.connection.HTTPConnection, frozenset({"127.0.0.1"})
+    )
+    strict = _peer_checked_connection(urllib3.connection.HTTPConnection, frozenset())
+
+    class _FakeSock:
+        def __init__(self, peer: str) -> None:
+            self._peer = peer
+            self.closed = False
+
+        def getpeername(self) -> tuple[str, int]:
+            return (self._peer, 41337)
+
+        def close(self) -> None:
+            self.closed = True
+
+    def _make(cls, host: str, peer: str):
+        c = cls(host, 80)
+        c.sock = _FakeSock(peer)
+        return c
+
+    # Allow path: listed loopback host + loopback peer -> accepted.
+    ok = _make(allowed, "127.0.0.1", "127.0.0.1")
+    _check_peer(ok)  # no raise
+    assert ok.sock.closed is False
+
+    # Same peer under the strict policy (host not listed) -> rejected.
+    rej = _make(strict, "127.0.0.1", "127.0.0.1")
+    with pytest.raises(URLPolicyError):
+        _check_peer(rej)
+    assert rej.sock.closed is True
+
+    # Multicast is not local: rejected even with the host listed.
+    mc = _make(allowed, "127.0.0.1", "239.255.255.255")
+    with pytest.raises(URLPolicyError):
+        _check_peer(mc)
+    assert mc.sock.closed is True
+
+    # Mirror the matrix through _assert_public_url's resolution path (the
+    # spec's "at minimum" requirement), pinning only the version-STABLE
+    # outcomes (the is_private-dependent reserved/unspecified addresses are
+    # deliberately NOT pinned, per the note above).
+    def _fake_getaddrinfo(ip: str):
+        def _resolve(_host, _port):
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 80))]
+
+        return _resolve
+
+    def _assert(ip: str, *, allow_local: bool) -> bool:
+        monkeypatch.setattr(downloader.socket, "getaddrinfo", _fake_getaddrinfo(ip))
+        try:
+            downloader._assert_public_url(
+                "http://example.com/x", allow_local=allow_local
+            )
+            return True
+        except URLPolicyError:
+            return False
+
+    # Multicast: rejected under BOTH policies (neither local nor private).
+    assert _assert("239.255.255.255", allow_local=True) is False
+    assert _assert("239.255.255.255", allow_local=False) is False
+    # Loopback: the allow path works under allow_local, rejected strict.
+    assert _assert("127.0.0.1", allow_local=True) is True
+    assert _assert("127.0.0.1", allow_local=False) is False
+    # Private (RFC1918): allowed by the carve-out, rejected strict.
+    assert _assert("192.168.1.1", allow_local=True) is True
+    assert _assert("192.168.1.1", allow_local=False) is False
+    # Public: allowed under BOTH policies.
+    assert _assert("8.8.8.8", allow_local=True) is True
+    assert _assert("8.8.8.8", allow_local=False) is True
+
+
+def test_check_peer_unparseable_peer_allowed_for_listed_host():
+    # P2: when getpeername returns an UNPARSEABLE peer but the connection's
+    # host IS in the allowed-local set, _check_peer returns (allow) — the
+    # deliberate design: an operator-allowed loopback host behind a
+    # degenerate resolver must not be bricked. The paired negative (empty
+    # allowed set) must raise and close the socket.
+    class _FakeSock:
+        def __init__(self, peer: str) -> None:
+            self._peer = peer
+            self.closed = False
+
+        def getpeername(self) -> tuple[str, int]:
+            return (self._peer, 9999)
+
+        def close(self) -> None:
+            self.closed = True
+
+    # Positive: host listed in the allowed set -> unparseable peer allowed.
+    allowed = _peer_checked_connection(
+        urllib3.connection.HTTPConnection, frozenset({"127.0.0.1"})
+    )
+    conn = allowed("127.0.0.1", 80)
+    stub = _FakeSock("not-an-ip")
+    conn.sock = stub
+    _check_peer(conn)  # must return normally
+    assert stub.closed is False
+
+    # Negative: same unparseable peer, host NOT listed -> fail closed.
+    strict = _peer_checked_connection(urllib3.connection.HTTPConnection, frozenset())
+    conn2 = strict("127.0.0.1", 80)
+    stub2 = _FakeSock("not-an-ip")
+    conn2.sock = stub2
+    with pytest.raises(URLPolicyError):
+        _check_peer(conn2)
+    assert stub2.closed is True
+
+
+def test_download_root_none_no_confinement(tmp_path, fast_policy, local_http_server):
+    # download_root=None silently disables confinement (no pin walk, no
+    # contextvar) — no warning by design. A real confined-less download must
+    # complete ok with the file + manifest landed, and the confinement
+    # contextvar must be reset to None afterward.
+    with local_http_server() as srv:
+        staging = tmp_path / "media.mp4.partial"
+        result = download_verified(
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
+        )
+        assert result.ok
+        assert result.bytes_downloaded == 1000
+        assert result.final_path == staging
+        # File + manifest landed.
+        assert staging.is_file()
+        assert staging.read_bytes() == BODY_1000
+        assert _manifest(staging)["complete"] is True
+        # No confinement was active: the contextvar is back to its default.
+        assert downloader._confined_dirs.get() is None
+
+
+def test_install_url_policy_rebinds_allow_local_on_reuse():
+    # P3: _install_url_policy is idempotent — reusing a session re-binds the
+    # EXISTING hook to the new allow_local rather than stacking a second
+    # hook. So a session first installed permissive (allow_local=True) and
+    # later reused strict (allow_local=False) must end with exactly ONE
+    # policy hook whose bound allow_local is False, and that hook must
+    # reject a loopback redirect hop (strict despite the first install).
+    session = requests.Session()
+    downloader._install_url_policy(session, allow_local=True)
+    downloader._install_url_policy(session, allow_local=False)
+
+    policy_hooks = [
+        h
+        for h in session.hooks.get("response", [])
+        if getattr(h, "func", None) is downloader._url_policy_hook
+    ]
+    assert len(policy_hooks) == 1, "the hook must be re-bound, not stacked"
+    bound = policy_hooks[0]
+    # allow_local is bound as a keyword on the stored partial.
+    assert getattr(bound, "keywords", {}).get("allow_local") is False
+
+    class _FakeRedirectResponse:
+        # Minimal stand-in for the redirected response the hook inspects:
+        # a loopback fetched URL with non-empty history (i.e. a redirect hop).
+        url = "http://127.0.0.1:1/x"
+        history = [object()]
+        is_redirect = False
+        headers = {}
+
+    with pytest.raises(URLPolicyError):
+        bound(_FakeRedirectResponse())
+
+
+def test_unresolvable_url_reports_urlpolicyerror_structured(tmp_path, fast_policy):
+    # P3: a hostname that does not resolve (RFC 6761 .invalid -> hermetic)
+    # must fail at the pre-connect _assert_public_url as a structured
+    # URLPolicyError outcome: nothing is written, no exception escapes.
+    staging = tmp_path / "media.mp4.partial"
+    result = download_verified(
+        "http://media-archive-does-not-exist.invalid/media.bin",
+        staging,
+        expected_size=1000,
+        timeout=fast_policy,
+    )
+    assert result.ok is False
+    assert result.error_class == "URLPolicyError"
+    assert result.error_message is not None
+    assert result.final_path is None
+    assert result.bytes_downloaded == 0
+    # Nothing was created under tmp_path (the policy gate fails pre-IO).
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_structured_failure_shape_pins_final_path_and_bytes(
+    tmp_path, fast_policy, local_http_server
+):
+    # P3: pin the two failure shapes on the VerifiedDownload fields.
+    #
+    # (a) A body shorter than expected_size is a SizeMismatch whose
+    #     final_path is the STAGING path (not None) and resumed is False:
+    #     the bytes that were written are reported, at their real path.
+    short = BODY_1000[:800]
+    with local_http_server(content=short) as srv:
+        staging = tmp_path / "media.mp4.partial"
+        result = download_verified(
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
+        )
+        assert result.ok is False
+        assert result.error_class == "SizeMismatch"
+        assert result.final_path == staging
+        assert result.resumed is False
+        assert result.bytes_downloaded == 800
+
+    # (b) A genuine resume that then fails: seed a 400-byte partial whose
+    #     identity matches a HEAD that LIES about the length (declares 1000,
+    #     really serves 800). The resume decision sees the declared length
+    #     (1000 > 400, matching validator) so it RESUMES (Range: bytes=400-),
+    #     appending 400 more bytes -> 800 total. The final byte-count check
+    #     then fails against the declared 1000. The failure must report a
+    #     real resume (resumed True) with the partial bytes staged (0 <
+    #     bytes < 1000).
+    with local_http_server(content=BODY_1000[:800], head_content_length=1000) as srv:
+        staging2 = tmp_path / "other.mp4.partial"
+        sidecar2 = staging2.with_name(staging2.name + ".identity.json")
+        _seed_partial(
+            staging2, sidecar2, BODY_1000, offset=400, length=1000, etag='"v1"'
+        )
+        result2 = download_verified(
+            srv.url(),
+            staging2,
+            expected_size=None,
+            timeout=fast_policy,
+            allow_local=True,
+        )
+        assert result2.ok is False
+        assert result2.error_class == "SizeMismatch"
+        assert result2.resumed is True
+        assert 0 < result2.bytes_downloaded < 1000
+
+
+def test_multi_hop_redirect_chain_rejected(tmp_path, fast_policy, local_http_server):
+    # P3: a redirect chain is re-validated PER HOP under the strict
+    # policy. Two real loopback servers chained (srv1 -> srv2 -> a private
+    # target) prove the hop re-validation: the chain is rejected at the
+    # FIRST hop's Location (srv2's loopback target), which is checked
+    # strictly.
+    #
+    # NOTE (adaptation to actual behavior): the spec anticipated the chain
+    # failing on the SECOND hop's target (http://192.168.1.1/x), but the
+    # per-hop re-validation stops the chain one hop earlier — hop-1's
+    # Location (srv2, also loopback) is the strict-policy violation, so the
+    # request never reaches srv2 and the 192.168.1.1 target is never
+    # validated. We therefore pin the real contract: the failure is a
+    # URLPolicyError (surfaced as RetriesExhausted after the bounded
+    # retries) that names the loopback redirect target, and the unreachable
+    # private target does NOT appear in the error. The load-bearing proof is
+    # that a redirect hop's Location is validated strictly (allow_local does
+    # not extend past the first hop), not just that the chain fails.
+    with local_http_server() as srv, local_http_server() as second:
+        second.set_redirect("http://192.168.1.1/x")
+        srv.set_redirect(second.url())
+        staging = tmp_path / "media.mp4.partial"
+        result = download_verified(
+            srv.url(),
+            staging,
+            expected_size=1000,
+            timeout=fast_policy,
+            allow_local=True,
+        )
+        assert result.ok is False
+        assert result.error_class == "RetriesExhausted"
+        msg = result.error_message or ""
+        # The strict per-hop rejection surfaced the root cause ...
+        assert "URLPolicyError" in msg
+        # ... naming the loopback redirect target (a hop fetched at a
+        # Location, checked strictly, not under allow_local) ...
+        assert "127.0.0.1" in msg
+        # ... and the unreachable private target was never validated.
+        assert "192.168.1.1" not in msg

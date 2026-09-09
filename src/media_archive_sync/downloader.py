@@ -31,6 +31,7 @@ import requests
 import urllib3.connection
 import urllib3.connectionpool
 from requests.adapters import HTTPAdapter
+from urllib3 import Retry
 
 from .config import ArchiveConfig
 from .display import rich_progress_or_stderr
@@ -189,15 +190,16 @@ def _open_confined_parent_dirs(root: Path, *parents: Path) -> dict[Path, int]:
 
     Fd accounting: intermediate component fds are closed as soon as the
     next component opens — only the final (pinned) fd per parent is held,
-    so a walk of depth N leaks zero fds of its own. When a pinned parent
-    IS the root, the root's own fd is that parent's pinned fd and is
-    returned to the caller instead of closed here. The caller must
-    ``os.close`` every returned fd — including the root's when it was
-    handed over (see ``download_verified``); otherwise the helper closes
-    its own root fd once every parent is pinned. A failure to open a
-    later parent (or component) closes every fd that walk opened
-    (intermediates plus any newly opened final), in addition to the
-    already-pinned parents' fds (no fd leak on any path).
+    so a walk of depth N leaks zero fds of its own. A parent equal to the
+    root (in ANY raw spelling) pins an ``os.dup`` of the root descriptor —
+    one descriptor per key, so distinct spellings of the same directory
+    each get their own fd — never the root fd itself, so closing every
+    returned fd cannot double-close one. The caller must ``os.close``
+    every returned fd; this helper ALWAYS closes its own root fd (no
+    handover, see ``download_verified``). A failure to open a later
+    parent (or component) closes every fd that walk opened (intermediates
+    plus any newly opened final), in addition to the already-pinned
+    parents' fds (no fd leak on any path).
     """
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     root_fd = os.open(root, flags)
@@ -214,6 +216,14 @@ def _open_confined_parent_dirs(root: Path, *parents: Path) -> dict[Path, int]:
                 # rel is always relative (root == parent included, where it
                 # is "."): walk it component by component, each open
                 # dir_fd-relative to the component pinned just before it.
+                # A parent whose normalized form IS the root (in ANY raw
+                # spelling, e.g. root/inner/..) pins os.dup(root_fd) —
+                # never root_fd itself — so each distinct spelling key holds
+                # its own descriptor and closing every returned fd cannot
+                # double-close the same one.
+                if not rel.parts:
+                    fds[parent] = os.dup(root_fd)
+                    continue
                 fd = root_fd
                 for part in rel.parts:
                     fd = os.open(part, flags, dir_fd=fd)
@@ -223,9 +233,9 @@ def _open_confined_parent_dirs(root: Path, *parents: Path) -> dict[Path, int]:
                         # the new fd, so release it immediately.
                         os.close(walk_fds.pop())
                     walk_fds.append(fd)
-                # The pinned fd (a just-opened component, or root_fd when
-                # rel.parts is empty) is held by the caller, not by the
-                # walk; drop it from the in-progress set.
+                # The pinned fd (a just-opened component, or an os.dup of
+                # root_fd when rel.parts is empty) is held by the caller,
+                # not by the walk; drop it from the in-progress set.
                 fds[parent] = fd
                 walk_fds.clear()
     except BaseException:
@@ -238,12 +248,11 @@ def _open_confined_parent_dirs(root: Path, *parents: Path) -> dict[Path, int]:
             os.close(fd)
         raise
     finally:
-        # The root fd is the caller's to close only when it was handed
-        # over as a pinned parent (parent == root); every other path
-        # (including failures — see except — which never leave it pinned)
-        # closes it here.
-        if root_fd not in fds.values():
-            os.close(root_fd)
+        # The helper ALWAYS closes its own root fd: a parent equal to the
+        # root pins os.dup(root_fd), never root_fd itself (see the
+        # rel.parts check above), so the handover guard that once skipped
+        # the close is gone and can never leave a double-close or a leak.
+        os.close(root_fd)
     return fds
 
 
@@ -480,9 +489,23 @@ class _PeerCheckedHTTPAdapter(HTTPAdapter):
     preserve the structured failure identity.
     """
 
-    def __init__(self, allowed_local: frozenset[str]) -> None:
+    def __init__(
+        self,
+        allowed_local: frozenset[str],
+        max_retries: Retry | int | None = None,
+        pool_connections: int = 10,
+        pool_maxsize: int = 10,
+    ) -> None:
         self._mas_allowed_local = allowed_local
-        super().__init__()
+        # Transport config is forwarded to HTTPAdapter.__init__ so an adapter
+        # that replaces a caller-mounted one (see _install_peer_check) keeps
+        # that adapter's retry/pool settings instead of downgrading them to
+        # the defaults.
+        super().__init__(
+            max_retries=max_retries,
+            pool_connections=pool_connections,
+            pool_maxsize=pool_maxsize,
+        )
 
     def _guarded_pool_classes(self) -> dict[str, type]:
         """Peer-checked pool classes (http + https) for this allowed set.
@@ -563,6 +586,42 @@ class _PeerCheckedHTTPAdapter(HTTPAdapter):
             raise
 
 
+def _preserved_adapter_config(
+    adapter: object,
+) -> tuple[Retry | int | None, int, int]:
+    """Read the transport config off a scheme's mounted adapter.
+
+    Returns ``(max_retries, pool_connections, pool_maxsize)`` so the
+    peer-checked adapter that replaces it keeps the same transport behavior
+    (see :func:`_install_peer_check`). A :class:`HTTPAdapter` (including a
+    previous :class:`_PeerCheckedHTTPAdapter`) carries its config on itself:
+    the requests built-in adapter for a scheme holds ``Retry(0, read=False)``,
+    which round-trips unchanged through ``HTTPAdapter.__init__`` (``from_int``
+    returns a ``Retry`` as-is), so a fresh session's defaults are preserved
+    exactly, while a caller-provided ``HTTPAdapter(max_retries=1)`` keeps its
+    retry budget. Pool settings are stored as ``_pool_connections`` /
+    ``_pool_maxsize`` on the adapter (requests keeps the constructor values,
+    not the urllib3 PoolManager's).
+
+    A mounted adapter that is NOT a :class:`HTTPAdapter` (a bare
+    :class:`BaseAdapter` subclass, custom transport, or test double, or
+    ``None`` when the session has no adapter mounted for the scheme —
+    see :func:`_install_peer_check`) has no HTTPAdapter config to read:
+    it gets the standard fresh-session retry budget
+    (``Retry.from_int(DEFAULT_MAX_RETRIES)``) instead of downgrading to
+    the built-in ``Retry(0, read=False)``.
+    """
+    if isinstance(adapter, HTTPAdapter):
+        max_retries: Retry | int | None = adapter.max_retries
+    else:
+        max_retries = DEFAULT_MAX_RETRIES
+    return (
+        max_retries,
+        getattr(adapter, "_pool_connections", 10),
+        getattr(adapter, "_pool_maxsize", 10),
+    )
+
+
 def _install_peer_check(
     session: requests.Session, allowed_local: frozenset[str]
 ) -> None:
@@ -572,10 +631,55 @@ def _install_peer_check(
     peers are permitted — by default empty (strict). Passing a caller session
     in opts it into this guard as well as the :func:`_install_url_policy`
     redirect hook.
+
+    ``Session.mount`` REPLACES whatever adapter is currently mounted for a
+    scheme, so this install must not silently discard a caller's transport
+    config: for each scheme, the replacement peer-checked adapter is
+    constructed with the mounted adapter's ``max_retries`` /
+    ``pool_connections`` / ``pool_maxsize`` carried over (see
+    :func:`_preserved_adapter_config`).
+
+    A FRESH :class:`_PeerCheckedHTTPAdapter` is mounted on EVERY install —
+    even when the mounted adapter is already a :class:`_PeerCheckedHTTPAdapter`
+    from an earlier install. The allowed-local set is baked into the guarded
+    connection classes at pool-manager construction
+    (:meth:`_PeerCheckedHTTPAdapter.init_poolmanager`), so merely refreshing
+    the adapter's ``_mas_allowed_local`` in place would be inert for direct
+    pools: an already-constructed PoolManager would keep the FIRST install's
+    set. A fresh adapter (whose transport config is read from the previously
+    mounted one) guarantees every direct PoolManager created afterward bakes
+    the CURRENT ``allowed_local``. Mounting replaces by prefix, so nothing
+    stacks — no second adapter, no config loss.
+
+    This is deliberately asymmetric with :func:`_install_url_policy`, whose
+    redirect hook is refreshed in place on the SAME hook object (there is
+    nothing to replace there — the hook reads its bound args per redirect
+    hop, so in-place rebinding is effective); the peer-check connection
+    classes bake their allowed set at construction, so the adapter object
+    itself must be replaced, with its config preserved by construction.
     """
-    adapter = _PeerCheckedHTTPAdapter(allowed_local)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
+    adapters = {}
+    for prefix in ("http://", "https://"):
+        try:
+            adapter = session.get_adapter(prefix)
+        except requests.exceptions.InvalidSchema:
+            # No adapter is mounted for this scheme (an unusual caller
+            # session state). Fail closed to the default config branch
+            # of _preserved_adapter_config instead of letting the
+            # InvalidSchema escape the install phase — this is an
+            # internal setup step, and its failure message ("No
+            # connection adapters were found for ...") would be
+            # misleading for it.
+            adapter = None
+        retries, pool_connections, pool_maxsize = _preserved_adapter_config(adapter)
+        adapters[prefix] = _PeerCheckedHTTPAdapter(
+            allowed_local,
+            max_retries=retries,
+            pool_connections=pool_connections,
+            pool_maxsize=pool_maxsize,
+        )
+    for prefix, adapter in adapters.items():
+        session.mount(prefix, adapter)
 
 
 # Default configuration values
@@ -588,6 +692,9 @@ DEFAULT_CHUNK_SIZE = 8192
 # forever, bypassing the retry budget, so we raise IdentityConflictError and
 # let the caller consume a retry attempt instead.
 _MAX_IDENTITY_CONFLICT_RESTARTS = 2
+# Leaf-file mode for files this module creates: the staging file and the
+# identity manifest's tmp sibling are both opened with this mode.
+_LEAF_FILE_MODE = 0o644
 
 
 def download_file(
@@ -784,7 +891,9 @@ def _record_identity(path: Path, identity: dict, *, complete: bool) -> None:
     # dir_fd-relative as well (tmp and final are siblings under the same
     # pinned manifest parent); rename(2) replaces the final symlink itself
     # rather than following the target component, in either case.
-    fd = _open_confined_leaf(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    fd = _open_confined_leaf(
+        tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, _LEAF_FILE_MODE
+    )
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, indent=2) + "\n")
     parent_fd = _confined_parent_fd(path)
@@ -915,6 +1024,17 @@ def _read_body(
             # confined, so a parent symlink swap cannot redirect this
             # size guard to the swapped target's contents.
             actual = _confined_stat(staging_path).st_size
+        except FileNotFoundError:
+            # A fresh download whose server answered a 206 from zero
+            # (partial_size was 0, so no Range header was sent) has NO
+            # partial yet: a missing file is the expected state, not a
+            # single-writer violation, when base is 0 — the open below
+            # creates it and O_APPEND to the empty file is safe.
+            if base != 0:
+                raise _StagingFileChangedError(
+                    f"Staging file {staging_path} vanished before append"
+                ) from None
+            actual = 0
         except OSError as exc:
             raise _StagingFileChangedError(
                 f"Staging file {staging_path} vanished before append"
@@ -940,7 +1060,7 @@ def _read_body(
         if mode == "ab"
         else os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     )
-    fd = _open_confined_leaf(staging_path, open_flags, 0o644)
+    fd = _open_confined_leaf(staging_path, open_flags, _LEAF_FILE_MODE)
     with os.fdopen(fd, mode) as handle:
         for chunk in response.iter_content(chunk_size=chunk_size):
             if chunk:
@@ -1139,22 +1259,39 @@ def _verified_attempt(
     reaches this check with an empty partial) is adopted and consumed as-is,
     not restarted.
 
-    Where a pass restarts (range-not-honored, identity conflict, or a
-    mid-append staging change) the already-open streamed response is closed
-    WITHOUT draining: an unread streamed response closes the underlying
-    connection rather than returning it dirty to the pool, so there is nothing
-    to drain (draining a full 200 would fetch the whole object for no reason).
+    Where a pass restarts (range-not-honored, identity conflict, a mid-append
+    staging change, or a staging file that vanishes between the is_file probe
+    and the size probe) the already-open streamed response is closed WITHOUT
+    draining: an unread streamed response closes the underlying connection
+    rather than returning it dirty to the pool, so there is nothing to drain
+    (draining a full 200 would fetch the whole object for no reason). The
+    vanished-probe case has no open response yet, so it simply unlinks and
+    restarts the pass — no retry attempt is consumed.
     """
     conflict_restarts = 0
     while True:
         # Both checks resolve through the pinned parent fd when confined,
         # so a parent symlink swap cannot make the size read and the
         # existence check disagree (or point at the swapped target).
-        partial_size = (
-            _confined_stat(staging_path).st_size
-            if _confined_is_file(staging_path)
-            else 0
-        )
+        if _confined_is_file(staging_path):
+            try:
+                partial_size = _confined_stat(staging_path).st_size
+            except FileNotFoundError:
+                # The file vanished BETWEEN the is_file check and the stat.
+                # Translate that race into the SAME clean restart the
+                # "vanished before append" branch uses for the identical
+                # condition (log, unlink, restart the pass from byte zero
+                # without draining — nothing is open yet at this point, so
+                # there is no response to close), instead of letting a bare
+                # OSError escape and burn a retry attempt with backoff.
+                logger.warning(
+                    "Staging file %s vanished before probe; restarting",
+                    staging_path,
+                )
+                _confined_unlink(staging_path)
+                continue
+        else:
+            partial_size = 0
         recorded = _verified_identity(manifest_path)
         if _resume_decision(recorded, current, partial_size, expected_size):
             logger.warning(
@@ -1226,9 +1363,20 @@ def _verified_attempt(
                     response.close()
                     _confined_unlink(staging_path)
                     continue
+            # The write mode follows the RANGE premise (which is consistent
+            # with _range_outcome's resume premise): a body may be APPENDED
+            # to the existing partial only when a Range resume actually took
+            # place — i.e. the client sent a Range header (partial_size > 0)
+            # and the server answered a 206 for it. A 206 WITHOUT a prior
+            # partial (partial_size == 0) is still written with an "ab"
+            # open (O_APPEND to an empty/created file is safe, and
+            # _read_body's size guard re-checks the partial before the
+            # first write), but it is NOT a resumption: resumed is derived
+            # from partial_size, never from the bare 206 status code, so a
+            # server answering 206 for bytes=0- on a fresh download is not
+            # misreported as resumed.
             mode = "ab" if response.status_code == 206 else "wb"
-            if mode == "ab":
-                resumed = True
+            resumed = resumed or (mode == "ab" and partial_size > 0)
             try:
                 _read_body(
                     response,
@@ -1293,8 +1441,8 @@ def download_verified(
     Path confinement: when ``download_root`` is given, ``staging_path``,
     the identity manifest, and the manifest's tmp sibling must all
     resolve inside it (ValueError before any mkdir/IO), and a symlink
-    staging path is refused. When it is None, confinement is disabled
-    and a warning is logged.
+    staging path is refused. When it is None, confinement is silently
+    disabled by design (no warning is logged).
 
     Race window (accepted trade-off): the identity used for the resume
     decision is discovered via a HEAD request, and the body is fetched in
@@ -1320,7 +1468,7 @@ def download_verified(
             staging_path + '.identity.json').
         download_root: When given, staging/manifest paths must resolve
             under it and symlinks at the staging path are refused;
-            None disables confinement (warns).
+            None silently disables confinement by design (no warning).
         allow_local: When False (default), local-network (loopback/
             private/link-local) initial URLs are rejected. Enable only when
             the caller trusts the URL source.
@@ -1360,12 +1508,9 @@ def download_verified(
         _assert_no_symlinked_dirs_under_root(
             download_root, staging_path.parent, manifest_path.parent
         )
-    else:
-        logger.warning(
-            "download_verified without download_root; path confinement "
-            "disabled for %s",
-            staging_path,
-        )
+    # download_root=None silently disables path confinement: no pin walk,
+    # no _confined_dirs contextvar — leaf helpers fall back to the plain
+    # Path API. No warning by design.
     staging_path.parent.mkdir(parents=True, exist_ok=True)
 
     current: dict | None = None
