@@ -142,6 +142,14 @@ jobs:
           set -euo pipefail
           VERSION="${{ steps.version.outputs.new_version }}"
           V="${VERSION#v}"
+          # Backfill guard (review blocker): a dispatch for an ALREADY-TAGGED
+          # version must not rewrite pyproject.toml on main (it would push a
+          # downgrade commit). The tag existing means the version shipped;
+          # skip the whole bump, keeping main's history monotonic.
+          if git rev-parse "refs/tags/${VERSION}" >/dev/null 2>&1; then
+            echo "Tag ${VERSION} already exists — skipping version bump (backfill path)"
+            exit 0
+          fi
           CURRENT=$(grep '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
           if [ "$CURRENT" = "$V" ]; then
             echo "pyproject.toml already at $V — skipping"
