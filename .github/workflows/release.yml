@@ -52,6 +52,8 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-latest
+    outputs:
+      version_tag: ${{ steps.version.outputs.new_version }}
     permissions:
       contents: write
       packages: write
@@ -194,3 +196,49 @@ jobs:
           # (fill-after mode). The App's URL is configured in App settings,
           # never in the repo.
           gh release create "${VERSION}" --title "Release ${VERSION}" --notes ""
+
+  pypi:
+    # Publish sdist + wheel to PyPI via Trusted Publishing (OIDC — no
+    # API token stored). Idempotent: a version already on PyPI skips.
+    # One-time repo setup: add a "Trusted Publisher" on pypi.org for
+    # this project (owner=djdembeck, repo=media-archive-sync,
+    # workflow=release.yml, environment=release).
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    needs: [release]
+    permissions:
+      contents: read
+      id-token: write
+    environment: release
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release.outputs.version_tag }}
+
+      - name: Set up Python
+        uses: actions/setup-python@e797f83bcb11b83ae66ec4c6d10807a3a2591aeb # v6.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Build distributions
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet --upgrade build
+          python -m build
+
+      - name: Verify built version matches tag
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.release.outputs.version_tag }}"
+          python - "$VERSION" <<'EOF'
+          import pathlib, sys, tomllib
+          version = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
+          tag = sys.argv[1].lstrip("v")
+          if version != tag:
+              sys.exit(f"pyproject version {version!r} != tag {tag!r}")
+          print(f"version {version} matches tag")
+          EOF
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@76f52bc884231f62b9a034ebfe128415bbaabdfc # v1.13.0
