@@ -26,6 +26,10 @@ class TestInitExports:
         assert hasattr(media_archive_sync, "download_file")
         assert hasattr(media_archive_sync, "download_files")
         assert hasattr(media_archive_sync, "download_with_config")
+        assert hasattr(media_archive_sync, "download_verified")
+        assert hasattr(media_archive_sync, "TimeoutPolicy")
+        assert hasattr(media_archive_sync, "VerifiedDownload")
+        assert hasattr(media_archive_sync, "URLPolicyError")
         assert hasattr(media_archive_sync, "DownloadManager")
 
     def test_merge_exports(self):
@@ -107,6 +111,10 @@ class TestInitExports:
             "download_file",
             "download_files",
             "download_with_config",
+            "download_verified",
+            "TimeoutPolicy",
+            "VerifiedDownload",
+            "URLPolicyError",
             "DownloadManager",
             "merge_video_parts",
             "detect_video_parts",

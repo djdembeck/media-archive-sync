@@ -263,14 +263,37 @@ class TestDownloadFilesExtended:
         mock_head_response.headers = {"Content-Length": "16"}
         mock_head_response.status_code = 200
 
-        with patch("requests.head", return_value=mock_head_response):
+        # The skip-existing HEAD runs on a fresh GUARDED session (not the
+        # module-level requests.head), so the session's head is mocked.
+        # worker() creates a fresh GUARDED session for the HEAD (and a
+        # separate one for the GET); use side_effect so each call returns
+        # its own mock, all serving the mocked HEAD response.
+        sessions: list[MagicMock] = []
+
+        def _fresh_session() -> MagicMock:
+            session = MagicMock()
+            session.head.return_value = mock_head_response
+            sessions.append(session)
+            return session
+
+        with patch(
+            "media_archive_sync.downloader.requests.Session",
+            side_effect=_fresh_session,
+        ):
             result = download_files(
                 [("http://example.com/video.mp4", local_path)],
                 workers=1,
                 skip_existing=True,
             )
 
-        # Should skip the file
+        # The skip-existing path ran on a GUARDED session (not the
+        # module-level requests.head): the HEAD fired and the session was
+        # closed. The skip happens before the GET session is created, so
+        # exactly one session was opened.
+        assert len(sessions) == 1
+        sessions[0].head.assert_called_once()
+        sessions[0].close.assert_called_once()
+        # Should skip the file (sizes match).
         assert result[1] >= 1  # skip count
 
     def test_download_files_with_stop_event(self, tmp_path):
