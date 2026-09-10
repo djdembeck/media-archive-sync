@@ -217,7 +217,7 @@ jobs:
           ref: ${{ needs.release.outputs.version_tag }}
 
       - name: Set up Python
-        uses: actions/setup-python@e797f83bcb11b83ae66ec4c6d10807a3a2591aeb # v6.0.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
@@ -241,4 +241,9 @@ jobs:
           EOF
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@76f52bc884231f62b9a034ebfe128415bbaabdfc # v1.13.0
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        with:
+          # Trunk flow is idempotent (duplicate version-bump commit re-triggers
+          # this workflow with the tag-exists guard); skip already-uploaded
+          # files so reruns after a partial publish succeed.
+          skip-existing: true
