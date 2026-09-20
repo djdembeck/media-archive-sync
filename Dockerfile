@@ -1,5 +1,5 @@
 # Build stage
-FROM python:3.13-slim AS builder
+FROM python:3.14-slim AS builder
 
 # Version stamp — passed by release.yml: --build-arg VERSION="${VERSION}"
 # Defaults to "devel" for local/PR/develop builds.
@@ -30,7 +30,7 @@ RUN pip install --upgrade pip && \
     python -m build
 
 # Runtime stage
-FROM python:3.13-slim
+FROM python:3.14-slim
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
