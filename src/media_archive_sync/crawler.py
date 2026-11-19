@@ -48,6 +48,29 @@ def _href(a: Tag) -> str:
     return value[0] if value else ""
 
 
+def _nginx_row_size(a: Tag) -> int | None:
+    """Parse the human-readable size column of an autoindex table row.
+
+    The anchor's parent ``<tr>`` carries (filename, modified, size) cells;
+    the size is formatted as e.g. ``23 GB``, ``500 MB``, ``1.2 GB`` and
+    decoded as powers of 1024. Returns None when the row or cell is absent
+    (non-autoindex listing) so callers fall back to "unknown".
+    """
+    row = a.find_parent("tr")
+    if row is None:
+        return None
+    cells = row.find_all("td")
+    if len(cells) < 3:
+        return None
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(B|K|KB|M|MB|G|GB|T|TB)\b", cells[2].get_text())
+    if not m:
+        return None
+    unit = {"B": 0, "K": 1, "KB": 1, "M": 2, "MB": 2, "G": 3, "GB": 3, "T": 4, "TB": 4}[
+        m.group(2)
+    ]
+    return int(float(m.group(1)) * (1024**unit))
+
+
 def fetch_html(url: str) -> str:
     """Fetch HTML from a URL with timeout.
 
@@ -194,11 +217,17 @@ def crawl_archive(
 
 
 def fetch_directory(
-    dir_url: str, allowed_extensions: set[str] | None = None
-) -> list[tuple[str, str]]:
+    dir_url: str,
+    allowed_extensions: set[str] | None = None,
+    include_sizes: bool = False,
+) -> list[tuple[str, str] | tuple[str, str, int | None]]:
     """Fetch a single remote directory listing.
 
-    Returns a list of (full_url, decoded_basename) tuples for media files only.
+    Returns a list of (full_url, decoded_basename) tuples for media files
+    only. With ``include_sizes=True`` each item is a
+    (full_url, decoded_basename, size_bytes) tuple where size_bytes is the
+    listing's own size column (nginx autoindex) or None when the listing
+    carries no size data.
 
     This is a lightweight alternative to crawling the whole archive when
     we only need to check one directory for new files.
@@ -207,11 +236,13 @@ def fetch_directory(
         dir_url: The URL of the directory to fetch.
         allowed_extensions: Set of allowed file extensions (e.g., {'.mp4', '.mkv'}).
             If None, defaults to common video extensions.
+        include_sizes: Include the listing's per-file size (bytes) as a
+            third tuple element.
 
     Returns:
-        List of (full_url, decoded_basename) tuples for media files.
+        List of 2- or 3-tuples for media files, depending on include_sizes.
     """
-    out: list[tuple[str, str]] = []
+    out: list[tuple[str, str] | tuple[str, str, int | None]] = []
     if allowed_extensions is None:
         allowed_extensions = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
     extensions = allowed_extensions
@@ -246,7 +277,10 @@ def fetch_directory(
             if not re.search(rf"\.({ext_pattern})$", href_path, re.I):
                 continue
             dec = urldecode(Path(parsed_full.path).name)
-            out.append((full, dec))
+            if include_sizes:
+                out.append((full, dec, _nginx_row_size(a)))
+            else:
+                out.append((full, dec))
     except requests.RequestException as e:
         logger.debug("Failed to fetch directory listing %s: %s", dir_url, e)
     return out
