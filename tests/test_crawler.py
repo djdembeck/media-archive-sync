@@ -68,6 +68,52 @@ class TestFetchDirectory:
         assert len(result) == 1
         assert result[0][0].endswith("audio.mp3")
 
+    def test_fetch_directory_include_sizes_autoindex(self):
+        """include_sizes parses the nginx autoindex size column."""
+        html = """
+        <html><body><table>
+        <tr><th>Filename</th><th>Modified</th><th>Size</th></tr>
+        <tr><td><a href="../">../</a></td><td>-</td><td>-</td></tr>
+        <tr><td><a href="a.mp4">a.mp4</a></td><td>2026-11-16 00:00Z</td><td>23 GB</td></tr>
+        <tr><td><a href="b.mkv">b.mkv</a></td><td>2026-11-16 01:00Z</td><td>500 MB</td></tr>
+        <tr><td><a href="c.mp4">c.mp4</a></td><td>2026-11-16 02:00Z</td><td>1.5 GB</td></tr>
+        </table></body></html>
+        """
+        with patch("media_archive_sync.crawler.fetch_html", return_value=html):
+            result = fetch_directory("http://example.com/dir/", include_sizes=True)
+
+        assert len(result) == 3
+        sizes = {name: size for _, name, size in result}
+        assert sizes["a.mp4"] == 23 * 1024**3
+        assert sizes["b.mkv"] == 500 * 1024**2
+        assert sizes["c.mp4"] == int(1.5 * 1024**3)
+
+    def test_fetch_directory_include_sizes_no_table(self):
+        """include_sizes yields None when the listing has no size column."""
+        html = """
+        <html><body>
+        <a href="video.mp4">video.mp4</a>
+        </body></html>
+        """
+        with patch("media_archive_sync.crawler.fetch_html", return_value=html):
+            result = fetch_directory("http://example.com/dir/", include_sizes=True)
+
+        assert len(result) == 1
+        assert result[0][2] is None
+
+    def test_fetch_directory_default_excludes_sizes(self):
+        """Default call keeps the 2-tuple shape for existing consumers."""
+        html = """
+        <html><body><table>
+        <tr><td><a href="a.mp4">a.mp4</a></td><td>x</td><td>23 GB</td></tr>
+        </table></body></html>
+        """
+        with patch("media_archive_sync.crawler.fetch_html", return_value=html):
+            result = fetch_directory("http://example.com/dir/")
+
+        assert len(result) == 1
+        assert len(result[0]) == 2
+
     def test_fetch_directory_empty_html(self):
         """Test handling of empty HTML response."""
         with patch("media_archive_sync.crawler.fetch_html", return_value=""):
